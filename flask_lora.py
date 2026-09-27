@@ -1,6 +1,11 @@
-import serial
+import argparse
+import glob
+import os
 import threading
 import time
+
+import serial
+import serial.tools.list_ports
 from flask import Flask, request, jsonify, render_template
 
 app = Flask(__name__)
@@ -9,9 +14,17 @@ app = Flask(__name__)
 def index():
     return render_template('index.html')
 
-# Configure your serial port and baud rate here
-SERIAL_PORT = '/dev/ttyUSB0'
-BAUD_RATE = 115200
+# Serial port of the ESP32 LoRa bridge.
+#   None  -> auto-detect (CP210x / CH340 / FTDI / ESP32-S3 native USB, then any ttyUSB*/ttyACM*)
+#   Override with:  python3 flask_lora.py --port /dev/ttyACM0   or   LORA_PORT=/dev/ttyACM0
+SERIAL_PORT = os.environ.get('LORA_PORT') or None
+BAUD_RATE = int(os.environ.get('LORA_BAUD', '115200'))
+
+# USB vendor IDs of common ESP32 USB-serial chips
+ESP32_USB_VIDS = {0x10C4, 0x1A86, 0x0403, 0x303A}
+RECONNECT_INTERVAL_S = 2.0
+_last_connect_try = 0.0
+last_serial_error = "not opened yet"
 
 # How long to wait for the drone's reply. Each command makes the drone transmit
 # an "ACK <cmd>" packet first and then (for status-type commands) a
@@ -32,20 +45,102 @@ serial_lock = threading.Lock()
 write_lock = threading.Lock()   # guards ser.write() only, so emergencies can jump the queue
 
 
+def find_serial_port():
+    """Pick the ESP32's serial port."""
+    if SERIAL_PORT:
+        return SERIAL_PORT
+    ports = list(serial.tools.list_ports.comports())
+    for p in ports:
+        if p.vid in ESP32_USB_VIDS:
+            return p.device
+    for pattern in ('/dev/ttyUSB*', '/dev/ttyACM*'):
+        found = sorted(glob.glob(pattern))
+        if found:
+            return found[0]
+    return None
+
+
 def init_serial():
+    """Open the ESP32 port. Safe to call repeatedly; retries at most every 2 s."""
+    global ser, _last_connect_try, last_serial_error
+    if ser is not None and ser.is_open:
+        return True
+    now = time.time()
+    if now - _last_connect_try < RECONNECT_INTERVAL_S:
+        return False
+    _last_connect_try = now
+
+    port = find_serial_port()
+    if not port:
+        last_serial_error = "no /dev/ttyUSB* or /dev/ttyACM* found - is the ESP32 plugged in?"
+        print(f"[!] {last_serial_error}")
+        return False
+    try:
+        s = serial.Serial()
+        s.port = port
+        s.baudrate = BAUD_RATE
+        s.timeout = 0.5
+        # Don't pulse DTR/RTS on open: on most ESP32 boards that resets the chip,
+        # and the first commands would be lost while it reboots.
+        s.dtr = False
+        s.rts = False
+        s.open()
+        time.sleep(0.3)
+        s.reset_input_buffer()          # drop any boot banner
+        ser = s
+        last_serial_error = ""
+        print(f"[*] Connected to ESP32 LoRa bridge on {port} at {BAUD_RATE} baud.")
+        return True
+    except serial.SerialException as e:
+        msg = str(e)
+        if "Permission denied" in msg:
+            hint = "add yourself to the dialout group: sudo usermod -aG dialout $USER, then log out/in"
+        elif "busy" in msg.lower() or "Device or resource busy" in msg:
+            hint = "another program has the port open (Arduino serial monitor, simple_lora, ground_station.py?)"
+        else:
+            hint = "check the USB cable / port"
+        last_serial_error = f"{port}: {msg} -> {hint}"
+        print(f"[!] Serial error: {last_serial_error}")
+        ser = None
+        return False
+
+
+def drop_serial():
+    """Forget a port that failed mid-use so the next request reconnects."""
     global ser
     try:
-        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.5)
-        print(f"[*] Connected to LoRa module on {SERIAL_PORT} at {BAUD_RATE} baud.")
-    except Exception as e:
-        print(f"[!] Error connecting to serial port: {e}")
-        print("[!] Make sure the device is plugged in and permissions are set.")
+        if ser is not None:
+            ser.close()
+    except Exception:
+        pass
+    ser = None
+
+
+def serial_watchdog():
+    """Keep trying to (re)connect in the background, e.g. after unplug/replug."""
+    while True:
+        if ser is None or not ser.is_open:
+            with write_lock:
+                init_serial()
+        time.sleep(RECONNECT_INTERVAL_S)
+
+
+@app.route('/serial')
+def serial_status():
+    connected = ser is not None and ser.is_open
+    return jsonify({"connected": connected,
+                    "port": ser.port if connected else find_serial_port(),
+                    "error": "" if connected else last_serial_error})
 
 
 def write_line(cmd):
     with write_lock:
-        ser.write(f"{cmd}\n".encode('utf-8'))
-        ser.flush()
+        try:
+            ser.write(f"{cmd}\n".encode('utf-8'))
+            ser.flush()
+        except (serial.SerialException, OSError):
+            drop_serial()
+            raise
 
 
 def command_action(cmd):
@@ -62,7 +157,10 @@ def command_target(cmd):
 @app.route('/send', methods=['POST', 'GET'])
 def send_command():
     if ser is None or not ser.is_open:
-        return jsonify({"error": "Serial port not connected"}), 500
+        with write_lock:
+            init_serial()
+    if ser is None or not ser.is_open:
+        return jsonify({"error": f"Serial port not connected ({last_serial_error})"}), 500
 
     # Get the command from query string (GET) or JSON/Form (POST)
     if request.method == 'POST':
@@ -147,6 +245,9 @@ def send_command():
             return jsonify({"status": "success", "command": cmd, "response": ack, "ack": ack}), 200
         return jsonify({"status": "timeout", "command": cmd, "message": "No response from drone"}), 408
 
+    except (serial.SerialException, OSError) as e:
+        drop_serial()                  # USB unplugged / ESP32 reset: reconnect next time
+        return jsonify({"error": f"Serial link lost: {e}"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
@@ -154,7 +255,21 @@ def send_command():
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="LoRa ground station web relay (ESP32 SX1262 over USB)")
+    parser.add_argument("--port", help="ESP32 serial port (default: auto-detect)")
+    parser.add_argument("--baud", type=int, default=BAUD_RATE)
+    parser.add_argument("--host", default="0.0.0.0", help="use 127.0.0.1 to allow only this computer")
+    parser.add_argument("--web-port", type=int, default=5000)
+    args = parser.parse_args()
+    if args.port:
+        SERIAL_PORT = args.port
+    BAUD_RATE = args.baud
+
+    print("[*] Serial ports seen:",
+          ", ".join(f"{p.device} ({p.description})" for p in serial.tools.list_ports.comports()) or "none")
     init_serial()
-    # Run the Flask app on all interfaces, port 5000.
+    threading.Thread(target=serial_watchdog, daemon=True).start()
+
+    print(f"[*] Web UI: http://localhost:{args.web_port}")
     # threaded=True so an emergency LAND request isn't stuck behind a poll request.
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host=args.host, port=args.web_port, threaded=True)
