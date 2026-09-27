@@ -15,7 +15,8 @@ def index():
     return render_template('index.html')
 
 # Serial port of the ESP32 LoRa bridge.
-#   None  -> auto-detect (CP210x / CH340 / FTDI / ESP32-S3 native USB, then any ttyUSB*/ttyACM*)
+#   None  -> auto-detect: USB-serial chips (CP210x / CH340 / FTDI / ESP32-S3), then any
+#            ttyUSB*/ttyACM*, then the Pi's GPIO UART (/dev/serial0 -> pins 8 TX / 10 RX)
 #   Override with:  python3 flask_lora.py --port /dev/ttyACM0   or   LORA_PORT=/dev/ttyACM0
 SERIAL_PORT = os.environ.get('LORA_PORT') or None
 BAUD_RATE = int(os.environ.get('LORA_BAUD', '115200'))
@@ -57,6 +58,10 @@ def find_serial_port():
         found = sorted(glob.glob(pattern))
         if found:
             return found[0]
+    # LoRa module wired to the Raspberry Pi's GPIO serial pins
+    for dev in ('/dev/serial0', '/dev/ttyAMA0', '/dev/ttyS0'):
+        if os.path.exists(dev):
+            return dev
     return None
 
 
@@ -72,7 +77,9 @@ def init_serial():
 
     port = find_serial_port()
     if not port:
-        last_serial_error = "no /dev/ttyUSB* or /dev/ttyACM* found - is the ESP32 plugged in?"
+        last_serial_error = ("no serial port found (USB or /dev/serial0). For GPIO wiring enable the UART: "
+                             "sudo raspi-config -> Interface Options -> Serial Port -> login shell NO, "
+                             "hardware YES, then reboot")
         print(f"[!] {last_serial_error}")
         return False
     try:
