@@ -25,6 +25,13 @@ import time
 from flask import Flask, request, jsonify, render_template
 
 app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0   # browsers always load the latest script.js
+
+
+@app.after_request
+def no_cache(resp):
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
 
 
 @app.route('/')
@@ -67,7 +74,53 @@ EMERGENCY_COMMANDS = {"land", "l", "stop", "estop"}
 SLOW_COMMANDS = {"arm", "t", "takeoff", "disarm", "rtl"}
 SLOW_WAIT_SECONDS = 8.0
 
-request_lock = threading.Lock()   # one command/reply exchange at a time
+# ============================================================
+# Priority scheduling
+#
+# LOW  priority: ping, status (background link checks). They never queue:
+#      if the radio is busy they are skipped, and a waiting low-priority
+#      exchange is cut short (after a short grace for its reply) the moment
+#      any other command arrives.
+# HIGH priority: every other command. Waits only for the radio, never for pings.
+# EMERGENCY (land/stop/estop): as HIGH, but if the radio is still busy after
+#      the grace period it is transmitted anyway without waiting for a reply.
+# ============================================================
+LOW_PRIORITY = {"ping", "status"}
+PREEMPT_GRACE_S = 0.6       # let an in-flight ping reply land before we transmit over it
+
+# Commands that are safe to send twice. If no reply arrives within
+# RETRY_AFTER_S they are re-sent once (e.g. lost because it collided with
+# a ping reply on air). Not "d" (would descend twice) and not the slow
+# commands (arm/takeoff may simply still be working).
+RETRY_SAFE = {"land", "l", "stop", "estop", "ys", "start", "track", "yz",
+              "tare", "reset", "set", "area", "sethome", "sensors", "snap"}
+RETRY_AFTER_S = 2.5
+
+exchange_lock = threading.Lock()   # one command/reply exchange on air at a time
+_high_lock = threading.Lock()
+_high_pending = 0
+preempt = threading.Event()        # set while a high-priority command wants the radio
+
+
+def _high_enter():
+    global _high_pending
+    with _high_lock:
+        _high_pending += 1
+        preempt.set()
+
+
+def _high_exit():
+    global _high_pending
+    with _high_lock:
+        _high_pending -= 1
+        if _high_pending <= 0:
+            _high_pending = 0
+            preempt.clear()
+
+
+def _high_waiting():
+    with _high_lock:
+        return _high_pending > 0
 
 
 # ============================================================
@@ -311,52 +364,79 @@ def send_command():
         return jsonify({"status": "success", "command": cmd,
                         "response": "BROADCAST SENT to all drones - replies not awaited"}), 200
 
-    # Emergency commands jump the queue if a status poll is waiting for its reply.
-    if action in EMERGENCY_COMMANDS and not request_lock.acquire(blocking=False):
+    if action in LOW_PRIORITY:
+        # Background check: never delay a real command.
+        if _high_waiting() or not exchange_lock.acquire(blocking=False):
+            return jsonify({"status": "skipped", "command": cmd,
+                            "message": "radio busy with a higher-priority command"}), 409
         try:
-            radio.send(cmd)
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-        return jsonify({"status": "success", "command": cmd,
-                        "response": "SENT (priority) - reply not awaited"}), 200
-    elif action not in EMERGENCY_COMMANDS:
-        request_lock.acquire()
-    # (an emergency command that got the lock immediately falls through, lock held)
+            return exchange(cmd, target, action, low=True)
+        finally:
+            exchange_lock.release()
 
+    _high_enter()
     try:
-        drain(radio.lines)          # forget stale replies
-        radio.send(cmd)
-
-        # Wait for THIS command's result from THIS drone:
-        #   status -> "[Drone N] A:..."      anything else -> "[Drone N] <keyword>: ..."
-        # An optional "ACK N <cmd>" (--lora-ack) is kept as a fallback answer.
-        expected = f"[Drone {target}] A:" if action == "status" else f"[Drone {target}] {action}:"
-        wait_s = SLOW_WAIT_SECONDS if action in SLOW_COMMANDS else MAX_WAIT_SECONDS
-        deadline = time.time() + wait_s
-        ack = ""
-        response = ""
-        while time.time() < deadline:
-            try:
-                line = radio.lines.get(timeout=max(0.01, deadline - time.time()))
-            except queue.Empty:
-                break
-            if line.startswith(f"ACK {target} "):
-                ack = line
-            elif line.startswith(expected):
-                response = line
-                break
-
-        if response:
-            return jsonify({"status": "success", "command": cmd, "response": response, "ack": ack}), 200
-        if ack:
-            return jsonify({"status": "success", "command": cmd, "response": ack, "ack": ack}), 200
-        return jsonify({"status": "timeout", "command": cmd,
-                        "message": "No reply from drone (running? right ID? rebuilt with reply support?)"}), 408
-
+        if action in EMERGENCY_COMMANDS:
+            if not exchange_lock.acquire(timeout=PREEMPT_GRACE_S + 0.3):
+                radio.send(cmd)
+                return jsonify({"status": "success", "command": cmd,
+                                "response": "SENT (priority) - reply not awaited"}), 200
+        else:
+            exchange_lock.acquire()
+        try:
+            return exchange(cmd, target, action, low=False)
+        finally:
+            exchange_lock.release()
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     finally:
-        request_lock.release()
+        _high_exit()
+
+
+def exchange(cmd, target, action, low):
+    """Send one command and wait for THIS drone's reply to THIS command.
+
+    status -> "[Drone N] A:..."   anything else -> "[Drone N] <keyword>: ..."
+    An optional "ACK N <cmd>" (--lora-ack) is kept as a fallback answer.
+    """
+    expected = f"[Drone {target}] A:" if action == "status" else f"[Drone {target}] {action}:"
+    wait_s = SLOW_WAIT_SECONDS if action in SLOW_COMMANDS else MAX_WAIT_SECONDS
+    attempts = 2 if (not low and action in RETRY_SAFE) else 1
+    ack = ""
+    t_first = time.time()
+
+    for attempt in range(attempts):
+        drain(radio.lines)                      # forget stale replies
+        t_sent = time.time()
+        radio.send(cmd)
+        if attempt:
+            print(f"[*] No reply to '{cmd}' - resent once")
+        per_try = RETRY_AFTER_S if attempt < attempts - 1 else wait_s
+        deadline = t_sent + per_try
+        preempted_at = None
+
+        while time.time() < deadline:
+            if low and preempt.is_set():
+                preempted_at = preempted_at or time.time()
+                if time.time() - preempted_at > PREEMPT_GRACE_S:
+                    return jsonify({"status": "skipped", "command": cmd,
+                                    "message": "pre-empted by a higher-priority command"}), 409
+            try:
+                line = radio.lines.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if line.startswith(f"ACK {target} "):
+                ack = line
+            elif line.startswith(expected):
+                rtt_ms = int((time.time() - t_sent) * 1000)
+                return jsonify({"status": "success", "command": cmd, "response": line,
+                                "ack": ack, "rtt_ms": rtt_ms, "attempts": attempt + 1}), 200
+
+    if ack:
+        return jsonify({"status": "success", "command": cmd, "response": ack, "ack": ack,
+                        "rtt_ms": int((time.time() - t_first) * 1000)}), 200
+    return jsonify({"status": "timeout", "command": cmd,
+                    "message": "No reply from drone (running? right ID? in range?)"}), 408
 
 
 if __name__ == '__main__':

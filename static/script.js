@@ -137,6 +137,8 @@ document.addEventListener('DOMContentLoaded', () => {
             if (response.ok) {
                 log(`RX // ${data.response}`, 'rx');
                 parseTelemetry(data.response);
+            } else if (response.status === 409) {
+                log(`SKIPPED // ${data.message}`, 'error');
             } else if (response.status === 408) {
                 log(`ERR // TIMEOUT - NO RESPONSE FROM C-${currentDroneId}`, 'error');
             } else {
@@ -153,79 +155,59 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // BACKGROUND AUTO-POLLING LOOP
+    // BACKGROUND LINK CHECK: ping the selected drone every 4 s.
+    // Pings are LOW priority on the server: they are skipped (409) whenever a
+    // real command is using the radio, and never delay one.
+    const PING_INTERVAL_MS = 4000;
+    const OFFLINE_AFTER_MISSES = 2;
+    const missCount = {};
     let isPolling = false;
-    async function pollMainDrone() {
-        if (isPolling) return;
-        
-        // If the user just clicked a manual command (like ARM), skip this polling cycle
-        // so we don't jam the LoRa module with status requests!
-        if (isTransmittingManual) {
-            setTimeout(pollMainDrone, 1000);
-            return;
-        }
-        
-        isPolling = true;
 
-        const droneId = currentDroneId; // Only poll the currently selected main drone
-        
-        if (!droneId) {
-            isPolling = false;
-            setTimeout(pollMainDrone, 1000);
+    function setBadge(droneId, text, cls) {
+        const badge = document.querySelector(`.asset-item[data-id="${droneId}"] .asset-status`);
+        if (badge) {
+            badge.textContent = text;
+            badge.className = `asset-status ${cls}`;
+        }
+    }
+
+    async function pingSelectedDrone() {
+        if (isPolling || isTransmittingManual || !currentDroneId) {
+            setTimeout(pingSelectedDrone, PING_INTERVAL_MS);
             return;
         }
+        isPolling = true;
+        const droneId = currentDroneId;
 
         try {
-            // Send the status request quietly in the background
             const response = await fetch('/send', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cmd: `${droneId}-status` })
+                body: JSON.stringify({ cmd: `${droneId}-ping` })
             });
-
             const data = await response.json();
-            
-            // Locate this drone in the left Asset Roster panel
-            const assetItem = document.querySelector(`.asset-item[data-id="${droneId}"]`);
-            const statusBadge = assetItem?.querySelector('.asset-status');
 
-            if (response.ok && data.response) {
-                const payloadStr = data.response.split('] ')[1];
-                if (payloadStr) {
-                    // Check armed state to decide if flying or standby
-                    const isArmed = payloadStr.includes('A:Y');
-                    if (statusBadge) {
-                        statusBadge.textContent = isArmed ? 'FLYING' : 'STANDBY';
-                        statusBadge.className = `asset-status ${isArmed ? 'status-flying' : 'status-standby'}`;
-                    }
-                    
-                    // Only update the dashboard if the operator hasn't switched
-                    // to another drone while this poll was in flight.
-                    if (droneId === currentDroneId) {
-                        parseTelemetry(data.response);
-                    }
-                }
+            if (response.status === 409) {
+                // Skipped because a real command had the radio - not a failure.
+            } else if (response.ok && data.response && data.response.includes('PONG')) {
+                missCount[droneId] = 0;
+                const armed = data.response.includes('A:Y');
+                const rtt = data.rtt_ms ? ` ${(data.rtt_ms / 1000).toFixed(1)}s` : '';
+                setBadge(droneId, (armed ? 'FLYING' : 'ONLINE') + rtt,
+                         armed ? 'status-flying' : 'status-standby');
+                if (droneId === currentDroneId) parseTelemetry(data.response);
             } else {
-                // Timeout or error: Mark offline
-                if (statusBadge) {
-                    statusBadge.textContent = 'OFFLINE';
-                    statusBadge.className = 'asset-status status-offline';
+                missCount[droneId] = (missCount[droneId] || 0) + 1;
+                if (missCount[droneId] >= OFFLINE_AFTER_MISSES) {
+                    setBadge(droneId, 'OFFLINE', 'status-offline');
                 }
             }
         } catch (error) {
-            // Network failure
-            const assetItem = document.querySelector(`.asset-item[data-id="${droneId}"]`);
-            if (assetItem) {
-                const statusBadge = assetItem.querySelector('.asset-status');
-                statusBadge.textContent = 'OFFLINE';
-                statusBadge.className = 'asset-status status-offline';
-            }
+            setBadge(droneId, 'OFFLINE', 'status-offline');
         }
-        
+
         isPolling = false;
-        // Wait before querying again. The drone radio is half-duplex and each poll
-        // makes it transmit twice (ACK + telemetry), so polling too fast drops commands.
-        setTimeout(pollMainDrone, 2500);
+        setTimeout(pingSelectedDrone, PING_INTERVAL_MS);
     }
 
     // Button Bindings
@@ -282,5 +264,5 @@ document.addEventListener('DOMContentLoaded', () => {
     // Init
     selectAsset("1", "C-1");
     // Start the endless background loop for the main drone
-    setTimeout(pollMainDrone, 1000);
+    setTimeout(pingSelectedDrone, 1000);
 });
