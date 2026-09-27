@@ -62,7 +62,7 @@ MAX_WAIT_SECONDS = 4.0
 EMERGENCY_COMMANDS = {"land", "l", "stop", "estop"}
 
 # Commands whose real answer is a telemetry line sent after the ACK.
-TELEMETRY_COMMANDS = {"status"}
+TELEMETRY_COMMANDS = {"status", "ping"}
 
 request_lock = threading.Lock()   # one command/reply exchange at a time
 
