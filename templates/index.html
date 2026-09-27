@@ -161,6 +161,7 @@
                         <div class="section-title">FLIGHT CONTROL & OVERRIDES</div>
                         <div class="cmd-grid-2">
                             <button class="cmd-btn btn-danger" data-cmd="land">LAND / E-STOP</button>
+                            <button class="cmd-btn btn-danger" id="btn-land-all">LAND ALL DRONES</button>
                             <button class="cmd-btn btn-warning" data-cmd="arm">ARM SYSTEMS</button>
                             <button class="cmd-btn" data-cmd="disarm">DISARM</button>
                             <button class="cmd-btn btn-info" data-cmd="rtl">RTL (RETURN)</button>
@@ -169,15 +170,15 @@
                             <div class="input-combo">
                                 <button class="cmd-btn btn-success" id="btn-takeoff">TAKEOFF</button>
                                 <select id="takeoff-alt" class="tactical-input">
+                                    <option value="2">2M</option>
+                                    <option value="5" selected>5M</option>
                                     <option value="10">10M</option>
                                     <option value="15">15M</option>
-                                    <option value="16">16M</option>
-                                    <option value="17">17M</option>
-                                    <option value="18">18M</option>
-                                    <option value="19">19M</option>
-                                    <option value="20" selected>20M</option>
-                                    <option value="22">22M</option>
-                                    <option value="24">24M</option>
+                                    <option value="20">20M</option>
+                                    <option value="30">30M</option>
+                                    <option value="40">40M</option>
+                                    <option value="50">50M</option>
+                                    <option value="65">65M</option>
                                 </select>
                             </div>
                             <div class="input-combo">

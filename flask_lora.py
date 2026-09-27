@@ -54,6 +54,11 @@ def command_action(cmd):
     return action.strip().split(' ')[0].lower()
 
 
+def command_target(cmd):
+    """'2-land' -> '2', 'all-land' -> 'all'"""
+    return cmd.split('-', 1)[0].strip() if '-' in cmd else ''
+
+
 @app.route('/send', methods=['POST', 'GET'])
 def send_command():
     if ser is None or not ser.is_open:
@@ -70,6 +75,21 @@ def send_command():
         return jsonify({"error": "No command provided. Use ?cmd=1-arm or send JSON {'cmd': '1-arm'}"}), 400
 
     cmd = cmd.strip()
+    target = command_target(cmd)
+    if not target:
+        return jsonify({"error": "Command must be '<drone id>-<cmd>' or 'all-<cmd>'"}), 400
+
+    # Broadcast to every drone: emergency only, sent immediately, never awaited
+    # (several drones answering at once would just collide on air).
+    if target.lower() == 'all':
+        if command_action(cmd) not in EMERGENCY_COMMANDS | {"rtl"}:
+            return jsonify({"error": "Only land / stop / estop / rtl can be sent to all drones"}), 400
+        try:
+            write_line(cmd)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        return jsonify({"status": "success", "command": cmd,
+                        "response": "BROADCAST SENT to all drones - replies not awaited"}), 200
 
     # Emergency commands go out immediately, even while a poll is waiting for its reply.
     if command_action(cmd) in EMERGENCY_COMMANDS and not serial_lock.acquire(blocking=False):
@@ -102,6 +122,16 @@ def send_command():
                 line = ser.readline().decode('utf-8', errors='replace').strip()
                 if not line:
                     continue
+                # Several drones share the channel: ignore anything that is not
+                # from the drone we just addressed.
+                if line.startswith("ACK"):
+                    if not line.startswith(f"ACK {target} "):
+                        continue
+                elif line.startswith("[Drone "):
+                    if not line.startswith(f"[Drone {target}]"):
+                        continue
+                else:
+                    continue           # unrelated / garbage line
                 if line.startswith("ACK"):
                     ack = line
                     if not wants_telemetry:

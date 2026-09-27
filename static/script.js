@@ -120,7 +120,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const fullCmd = `${currentDroneId}-${commandAction}`;
         
         spinner.classList.remove('hidden');
-        document.querySelectorAll('.cmd-btn').forEach(b => b.disabled = true);
+        // Never disable the red LAND buttons while waiting for a reply.
+        document.querySelectorAll('.cmd-btn:not(.btn-danger)').forEach(b => b.disabled = true);
         
         log(`TX // ${fullCmd}`, 'tx');
 
@@ -198,8 +199,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         statusBadge.className = `asset-status ${isArmed ? 'status-flying' : 'status-standby'}`;
                     }
                     
-                    // Because we only poll the current drone, we can safely update the dashboard
-                    parseTelemetry(data.response);
+                    // Only update the dashboard if the operator hasn't switched
+                    // to another drone while this poll was in flight.
+                    if (droneId === currentDroneId) {
+                        parseTelemetry(data.response);
+                    }
                 }
             } else {
                 // Timeout or error: Mark offline
@@ -231,8 +235,27 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
+    // Emergency broadcast: every drone on the channel lands (no replies awaited).
+    document.getElementById('btn-land-all')?.addEventListener('click', async () => {
+        log('TX // all-land (BROADCAST)', 'tx');
+        try {
+            const response = await fetch('/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cmd: 'all-land' })
+            });
+            const data = await response.json();
+            log(response.ok ? `RX // ${data.response}` : `ERR // ${data.error || 'BROADCAST FAILED'}`,
+                response.ok ? 'rx' : 'error');
+        } catch (error) {
+            log('ERR // OFFLINE - FAILED TO CONNECT TO RELAY', 'error');
+        }
+    });
+
     document.getElementById('btn-takeoff')?.addEventListener('click', () => {
-        const alt = document.getElementById('takeoff-alt').value || "20";
+        // Max 65 m: matches the drone's alt_safe_max (fence is 70 m).
+        const MAX_TAKEOFF_M = 65;
+        const alt = Math.min(Number(document.getElementById('takeoff-alt').value) || 5, MAX_TAKEOFF_M);
         sendUserCommand(`t ${alt}`);
     });
 
