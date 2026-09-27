@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tactical UAV Operations</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <!-- TOP BAR -->
+    <header class="top-bar">
+        <div class="top-left">
+            <div class="logo-shield">🛡️</div>
+            <div class="brand">
+                <span class="brand-title">LORA-LINK</span>
+                <span class="brand-sub">TACTICAL UAV OPERATIONS</span>
+            </div>
+        </div>
+        
+        <div class="top-stats">
+            <div class="stat-box">
+                <span class="stat-label">DRONES</span>
+                <span class="stat-value text-green">3 / 3</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-label">MISSIONS</span>
+                <span class="stat-value text-blue">0</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-label">ALERTS</span>
+                <span class="stat-value text-red">0</span>
+            </div>
+            <div class="stat-box">
+                <span class="stat-label">SYSTEM</span>
+                <span class="stat-value text-green">NOMINAL</span>
+            </div>
+        </div>
+
+        <div class="top-right">
+            <div class="user-info">
+                <span class="user-role">System Administrator</span>
+                <span class="user-email">admin@lora.local - ADMIN</span>
+            </div>
+            <div class="status-badge link-online">LINK ONLINE</div>
+            <div class="time-display" id="clock">00:00:00</div>
+        </div>
+    </header>
+
+    <div class="main-layout">
+        <!-- SIDEBAR -->
+        <aside class="sidebar">
+            <div class="nav-section">
+                <div class="nav-title">NAVIGATION</div>
+                <ul class="nav-list">
+                    <li><span class="nav-code">CMD</span> Command</li>
+                    <li class="active"><span class="nav-code">OPS</span> Live Operations</li>
+                    <li><span class="nav-code">CTL</span> Drone Control</li>
+                    <li><span class="nav-code">ALT</span> Alerts Center</li>
+                    <li><span class="nav-code">RPL</span> Flight History</li>
+                    <li><span class="nav-code">3DT</span> 3D Terrain Tracker</li>
+                    <li class="nav-red"><span class="nav-code">ADM</span> User Management</li>
+                </ul>
+            </div>
+            
+            <div class="session-section">
+                <div class="nav-title">SESSION</div>
+                <div class="session-user">System Administrator</div>
+                <div class="session-sub">admin@lora.local - admin</div>
+                <button class="logout-btn">LOGOUT</button>
+            </div>
+        </aside>
+
+        <!-- CONTENT AREA -->
+        <div class="content-area">
+            
+            <!-- COLUMN 1: Telemetry & Asset Roster -->
+            <div class="panel col-telemetry">
+                <div class="panel-header">
+                    <span>TELEMETRY // <span id="telemetry-drone-id">SELECT ASSET</span></span>
+                    <button class="small-btn text-green">INJECT</button>
+                </div>
+                
+                <div class="telemetry-grid">
+                    <div class="tel-box">
+                        <span class="tel-label">ALTITUDE</span>
+                        <span class="tel-val" id="tel-alt">--</span>
+                    </div>
+                    <div class="tel-box">
+                        <span class="tel-label">GND HGT</span>
+                        <span class="tel-val" id="tel-baro">--</span>
+                    </div>
+                    <div class="tel-box">
+                        <span class="tel-label">ARMED STATE</span>
+                        <span class="tel-val" id="tel-armed">--</span>
+                    </div>
+                    <div class="tel-box">
+                        <span class="tel-label">FLIGHT MODE</span>
+                        <span class="tel-val" id="tel-mode">--</span>
+                    </div>
+                    <div class="tel-box">
+                        <span class="tel-label">SATELLITES</span>
+                        <span class="tel-val" id="tel-sats">--</span>
+                    </div>
+                    <div class="tel-box">
+                        <span class="tel-label">GPS STATUS</span>
+                        <span class="tel-val text-green" id="tel-gps-lock">WAITING</span>
+                    </div>
+                </div>
+
+                <div class="progress-bars">
+                    <div class="prog-row">
+                        <span>BATTERY</span>
+                        <div class="prog-bar-container"><div class="prog-bar" style="width: 100%;"></div></div>
+                        <span>100%</span>
+                    </div>
+                    <div class="prog-row">
+                        <span>SIGNAL</span>
+                        <div class="prog-bar-container"><div class="prog-bar" style="width: 95%;"></div></div>
+                        <span>95%</span>
+                    </div>
+                </div>
+
+                <div class="gps-coords">
+                    POS: <span id="tel-loc">--</span>
+                </div>
+
+                <div class="panel-header mt-2">
+                    <span>ASSET ROSTER</span>
+                    <button class="small-btn text-green">REGISTER</button>
+                </div>
+                
+                <div class="asset-list">
+                    <div class="asset-item active" data-id="1">
+                        <span class="asset-name">C-1</span>
+                        <span class="asset-status status-flying">FLYING</span>
+                    </div>
+                    <div class="asset-item" data-id="2">
+                        <span class="asset-name">C-2</span>
+                        <span class="asset-status status-standby">STANDBY</span>
+                    </div>
+                    <div class="asset-item" data-id="3">
+                        <span class="asset-name">C-3</span>
+                        <span class="asset-status status-offline">OFFLINE</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- COLUMN 2: Commands -->
+            <div class="panel col-commands">
+                <div class="panel-header">
+                    <span>COMMAND UPLINK // <span id="command-drone-id">C-1</span></span>
+                    <span id="loading-spinner" class="loader hidden"></span>
+                </div>
+                
+                <div class="cmd-sections-scroll">
+                    <!-- Emergency & Flight Control -->
+                    <div class="cmd-section">
+                        <div class="section-title">FLIGHT CONTROL & OVERRIDES</div>
+                        <div class="cmd-grid-2">
+                            <button class="cmd-btn btn-danger" data-cmd="land">LAND / E-STOP</button>
+                            <button class="cmd-btn btn-warning" data-cmd="arm">ARM SYSTEMS</button>
+                            <button class="cmd-btn" data-cmd="disarm">DISARM</button>
+                            <button class="cmd-btn btn-info" data-cmd="rtl">RTL (RETURN)</button>
+                        </div>
+                        <div class="cmd-grid-3 mt-1">
+                            <div class="input-combo">
+                                <button class="cmd-btn btn-success" id="btn-takeoff">TAKEOFF</button>
+                                <select id="takeoff-alt" class="tactical-input">
+                                    <option value="5">5M</option>
+                                    <option value="10">10M</option>
+                                    <option value="20" selected>20M</option>
+                                    <option value="50">50M</option>
+                                </select>
+                            </div>
+                            <div class="input-combo">
+                                <button class="cmd-btn" id="btn-down">DESCEND</button>
+                                <input type="number" id="down-meters" value="1" step="0.5" class="tactical-input" placeholder="M">
+                            </div>
+                            <button class="cmd-btn" data-cmd="sethome here">SET HOME</button>
+                        </div>
+                    </div>
+
+                    <!-- CV & Tracking -->
+                    <div class="cmd-section">
+                        <div class="section-title">COMPUTER VISION & TRACKING</div>
+                        <div class="cmd-grid-3">
+                            <button class="cmd-btn btn-primary" data-cmd="start">START TRACK</button>
+                            <button class="cmd-btn" data-cmd="yz">STOP TRACK</button>
+                            <div class="input-combo">
+                                <button class="cmd-btn" id="btn-area">SET AREA</button>
+                                <input type="number" id="area-px" value="3000" class="tactical-input" placeholder="PX">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Telemetry -->
+                    <div class="cmd-section">
+                        <div class="section-title">SENSORS & TELEMETRY</div>
+                        <div class="cmd-grid-3">
+                            <button class="cmd-btn btn-primary" data-cmd="status">POLL STATUS</button>
+                            <button class="cmd-btn" data-cmd="sensors">SENSORS</button>
+                            <button class="cmd-btn" data-cmd="tare">TARE ALT</button>
+                        </div>
+                    </div>
+
+                    <!-- Utilities -->
+                    <div class="cmd-section">
+                        <div class="section-title">SYSTEM UTILITIES</div>
+                        <div class="cmd-grid-2">
+                            <button class="cmd-btn" data-cmd="snap">SNAPSHOT</button>
+                            <button class="cmd-btn" data-cmd="reset">RESET PID</button>
+                        </div>
+                        <div class="input-combo mt-1" style="display: flex;">
+                            <button class="cmd-btn btn-info" id="btn-set-param" style="flex: 1;">LIVE TUNE</button>
+                            <input type="text" id="tune-param" placeholder="PARAM" class="tactical-input" style="flex: 2;">
+                            <input type="text" id="tune-val" placeholder="VAL" class="tactical-input" style="flex: 1;">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- COLUMN 3: Logs (Replacing Video Feeds) -->
+            <div class="panel col-logs">
+                <div class="panel-header">
+                    <span>UPLINK LOGS // SYSTEM</span>
+                    <button class="small-btn text-green">CLEAR</button>
+                </div>
+                
+                <div class="log-window" id="terminal-log">
+                    <div class="log-entry system">SYSTEM BOOT SEQUENCE INITIATED...</div>
+                    <div class="log-entry system">ESTABLISHING LORA SECURE LINK...</div>
+                    <div class="log-entry system text-green">LINK ESTABLISHED. AWAITING COMMANDS.</div>
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <!-- BOTTOM BAR -->
+    <footer class="bottom-bar">
+        <div class="bot-left">
+            <span>LINK: <span class="text-green">ENCRYPTED</span></span>
+            <span>MESH: <span class="text-green">3 NODES</span></span>
+            <span>LATENCY: <span class="text-green">42 MS</span></span>
+        </div>
+        <div class="bot-right">
+            <span>TOGGLE OFFLINE MODE</span>
+            <span>BUILD 2026.09.27-T</span>
+        </div>
+    </footer>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
