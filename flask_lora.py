@@ -143,24 +143,53 @@ class SpiRadio:
             print(f"[!] {self.error}")
             return
 
-        self.LoRa = SX126x()
-        print("[*] Initializing SX1262...")
-        if not self.LoRa.begin(SPI_BUS, SPI_CS, PIN_RESET, PIN_BUSY, PIN_IRQ, PIN_TXEN, PIN_RXEN):
-            self.error = ("LoRa init failed - check wiring, that SPI is enabled (raspi-config), "
-                          "and that lora-c.py / another program isn't still running")
-            print(f"[!] {self.error}")
+        self._SX126x = SX126x
+        # IRQ pin interrupts (edge detection) are optional: if the Pi refuses them
+        # ("Failed to add edge detection"), fall back to polling with irq = -1.
+        self.irq_pin = -1 if os.environ.get("LORA_NO_IRQ") else PIN_IRQ
+        if not self._init(self.irq_pin):
             return
+        threading.Thread(target=self._receive_loop, daemon=True).start()
+
+    def _init(self, irq_pin):
+        self.LoRa = self._SX126x()
+        mode = f"IRQ on GPIO{irq_pin}" if irq_pin >= 0 else "polling (no IRQ pin)"
+        print(f"[*] Initializing SX1262 ({mode})...")
+        try:
+            ok = self.LoRa.begin(SPI_BUS, SPI_CS, PIN_RESET, PIN_BUSY, irq_pin, PIN_TXEN, PIN_RXEN)
+        except RuntimeError as e:
+            ok = False
+            print(f"[!] begin() error: {e}")
+        if not ok:
+            self.ok = False
+            self.error = ("LoRa init failed - check wiring, that SPI is enabled (raspi-config), "
+                          "and that lora-c.py / another flask_lora.py isn't still running")
+            print(f"[!] {self.error}")
+            return False
 
         self.LoRa.setFrequency(FREQUENCY)
         self.LoRa.setTxPower(TX_POWER, self.LoRa.TX_POWER_SX1262)
         self.LoRa.setLoRaModulation(SPREADING_FACTOR, BANDWIDTH, CODING_RATE)
         self.LoRa.setLoRaPacket(self.LoRa.HEADER_EXPLICIT, PREAMBLE_LEN, 255, crcType=True)
         self.LoRa.setSyncWord(SYNC_WORD)
+        self.irq_pin = irq_pin
         self.ok = True
+        self.error = ""
         print(f"[*] Radio ready | {FREQUENCY / 1e6} MHz | SF{SPREADING_FACTOR} | "
-              f"{BANDWIDTH / 1000:.0f} kHz | {TX_POWER} dBm")
+              f"{BANDWIDTH / 1000:.0f} kHz | {TX_POWER} dBm | {mode}")
+        return True
 
-        threading.Thread(target=self._receive_loop, daemon=True).start()
+    def _fallback_to_polling(self, err):
+        print(f"[!] GPIO edge detection failed ({err}).\n"
+              f"    Usually another program still holds GPIO{PIN_IRQ} "
+              f"(check: ps aux | grep -E 'lora|flask'). Switching to polling mode.")
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.remove_event_detect(PIN_IRQ)
+        except Exception:
+            pass
+        if self._init(-1):
+            self._rx()
 
     def _rx(self):
         self.LoRa.request(self.LoRa.RX_CONTINUOUS)
@@ -169,11 +198,19 @@ class SpiRadio:
         # Same as lora-c.py send_message(): append "\n", transmit, back to RX.
         data = list((text + "\n").encode())
         with self._lock:
-            self.LoRa.beginPacket()
-            self.LoRa.write(data, len(data))
-            self.LoRa.endPacket()
-            self.LoRa.wait()
-            self._rx()
+            for attempt in (1, 2):
+                try:
+                    self.LoRa.beginPacket()
+                    self.LoRa.write(data, len(data))
+                    self.LoRa.endPacket()
+                    self.LoRa.wait()
+                    self._rx()
+                    return
+                except RuntimeError as e:
+                    if "edge detection" in str(e) and self.irq_pin >= 0 and attempt == 1:
+                        self._fallback_to_polling(e)
+                        continue
+                    raise
 
     def _emit(self, parts):
         text = "".join(parts)
@@ -216,7 +253,10 @@ class SpiRadio:
                 print(f"[!] RX error: {e}")
                 try:
                     with self._lock:
-                        self._rx()
+                        if "edge detection" in str(e) and self.irq_pin >= 0:
+                            self._fallback_to_polling(e)
+                        else:
+                            self._rx()
                 except Exception:
                     pass
                 time.sleep(0.2)
@@ -371,6 +411,9 @@ def send_command():
                             "message": "radio busy with a higher-priority command"}), 409
         try:
             return exchange(cmd, target, action, low=True)
+        except Exception as e:
+            print(f"[!] {cmd}: {e}")
+            return jsonify({"error": str(e)}), 500
         finally:
             exchange_lock.release()
 
