@@ -61,8 +61,11 @@ MAX_WAIT_SECONDS = 4.0
 # Commands that must never queue behind a background status poll.
 EMERGENCY_COMMANDS = {"land", "l", "stop", "estop"}
 
-# Commands whose real answer is a telemetry line sent after the ACK.
-TELEMETRY_COMMANDS = {"status", "ping"}
+# Every drone command now replies "[Drone N] <keyword>: <result>"
+# (status replies "[Drone N] A:..|M:..").  Slow commands get longer to answer:
+# arm retries in STABILIZE and takeoff arms first.
+SLOW_COMMANDS = {"arm", "t", "takeoff", "disarm", "rtl"}
+SLOW_WAIT_SECONDS = 8.0
 
 request_lock = threading.Lock()   # one command/reply exchange at a time
 
@@ -324,10 +327,12 @@ def send_command():
         drain(radio.lines)          # forget stale replies
         radio.send(cmd)
 
-        # The drone answers "ACK <id> <cmd>"; for status a "[Drone N] ..." line follows.
-        # Several drones share the channel, so only accept replies from this one.
-        wants_telemetry = action in TELEMETRY_COMMANDS
-        deadline = time.time() + MAX_WAIT_SECONDS
+        # Wait for THIS command's result from THIS drone:
+        #   status -> "[Drone N] A:..."      anything else -> "[Drone N] <keyword>: ..."
+        # An optional "ACK N <cmd>" (--lora-ack) is kept as a fallback answer.
+        expected = f"[Drone {target}] A:" if action == "status" else f"[Drone {target}] {action}:"
+        wait_s = SLOW_WAIT_SECONDS if action in SLOW_COMMANDS else MAX_WAIT_SECONDS
+        deadline = time.time() + wait_s
         ack = ""
         response = ""
         while time.time() < deadline:
@@ -337,9 +342,7 @@ def send_command():
                 break
             if line.startswith(f"ACK {target} "):
                 ack = line
-                if not wants_telemetry:
-                    break
-            elif line.startswith(f"[Drone {target}]"):
+            elif line.startswith(expected):
                 response = line
                 break
 
@@ -348,7 +351,7 @@ def send_command():
         if ack:
             return jsonify({"status": "success", "command": cmd, "response": ack, "ack": ack}), 200
         return jsonify({"status": "timeout", "command": cmd,
-                        "message": "No response from drone (is it running with --lora-ack?)"}), 408
+                        "message": "No reply from drone (running? right ID? rebuilt with reply support?)"}), 408
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
