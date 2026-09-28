@@ -185,7 +185,8 @@ def record_line(line, rssi=None, snr=None):
             st["goto"] = {"active": False, "remaining_m": None}   # ARRIVED / BALLOON SEEN / TIMEOUT
         snapshot = json.loads(json.dumps(st))
     _queue_push(snapshot)
-    tower_send({"type": "telemetry", "tower_id": TOWER_ID, "drone": _with_online(snapshot)})
+    # (Drone telemetry is NOT sent on the tower socket: the server would treat a
+    #  "telemetry" message there as the tower's own position. It goes by POST instead.)
 
 
 def _with_online(st):
@@ -531,35 +532,33 @@ def send_command():
 
 
 # ----------------------------------------------------------------------------
-# Tower socket listener
+# Tower socket listener  (Synaix backend protocol)
 #
-# Keeps a WebSocket open to the Synaix backend. The backend sends commands
-# (e.g. "1-status") and target GPS points; each command is relayed over LoRa
-# and the result is sent back on the same socket. Every telemetry update is
-# also streamed up the socket.
+# Connects to  wss://api.synaix.viclyx.com/ws?deviceType=tower&droneId=<TOWER_ID>[&key=<TOWER_KEY>]
+# and waits. The server sends:
+#   {"type": "connected", ...}                                   handshake (logged)
+#   {"type": "execute_command", "cmdId": "...", "droneId": "DRONE-1",
+#    "command": "TAKEOFF", "params": {"altitude": 20}, ...}      -> relayed over LoRa as "1-t 20"
+#   {"event": "telemetry:update" | "drone:status" | "alert:..."}  broadcasts, ignored quietly
+# Older formats still work: plain text "1-status", {"command": "1-status"}, target GPS objects.
 #
-#   TOWER_ID=TWR-01            (default)
+# Server command -> drone command (drone number = digits at the end of droneId):
+#   ARM arm | DISARM disarm | LAND land | STOP stop | ESTOP / EMERGENCY_STOP estop | RTL rtl
+#   TAKEOFF {altitude} t <alt> | DESCEND {meters} d <m> | STATUS status | PING ping | SENSORS sensors
+#   START_TRACKING / TRACK ys | STOP_TRACKING yz | TARE tare | SNAPSHOT snap | RESET reset
+#   GOTO / GYS / TARGET {lat, lon, altitude?}  gys <lat> <lon> [alt]   (fly there, chase balloon)
+#   SET_HOME {lat, lon, altitude?} sethome ... (no params: sethome here) | AREA {px} area <px>
+#   SET_PARAM {name, value} set <name> <value>
+#   lowercase text is passed straight through (e.g. "t 20"); unknown UPPERCASE commands are refused.
+#
+#   TOWER_ID=Tower-1           (default; sent as droneId)
+#   TOWER_KEY=...              (optional; sent as &key=...)
 #   TOWER_WS_URL=wss://...     (default: wss://api.synaix.viclyx.com/ws;
 #                               https:// and http:// are converted to wss:// and ws://)
-#   TOWER_TOKEN=secret         (optional, sent as "Authorization: Bearer secret")
 #   TOWER_LISTEN=0             (disable the listener)
-#
-# Accepted incoming messages (text or JSON):
-#   1-status                                         plain text, one command per line
-#   {"command": "1-status"}                          also "cmd"
-#   {"drone_id": "1", "command": "status"}           id prefixed automatically
-#   {"type": "target", "drone_id": "1", "lat": 43.75861, "lon": -79.42124, "alt": 20}
-#   {"drone_id": "1", "target": {"lat": ..., "lon": ..., "alt": ...}}
-#       -> sent to the drone as "1-gys <lat> <lon> [alt]" (fly there, chase balloon)
-#   Any JSON message may carry "request_id" (or "id"); it is echoed in the reply.
-#
-# Outgoing messages:
-#   {"type": "hello", "tower_id": "TWR-01"}                          on connect
-#   {"type": "command_result", "tower_id", "request_id", "command", "status", "response", "telemetry", ...}
-#   {"type": "telemetry", "tower_id", "drone": {<per-drone JSON, same as /telemetry/<id>>}}
-#   {"type": "error", "tower_id", "request_id", "error"}
+#   TOWER_SEND=1               (also send command_ack back; default is listen-only)
 # ----------------------------------------------------------------------------
-TOWER_ID = os.environ.get('TOWER_ID', 'TWR-01')
+TOWER_ID = os.environ.get('TOWER_ID', 'Tower-1')
 def _ws_url(url):
     """WebSockets use ws:// / wss://; accept http(s):// too and convert."""
     url = url.strip()
@@ -571,8 +570,23 @@ def _ws_url(url):
 
 
 TOWER_WS_URL = _ws_url(os.environ.get('TOWER_WS_URL', 'wss://api.synaix.viclyx.com/ws'))
-TOWER_TOKEN = os.environ.get('TOWER_TOKEN', '').strip()
+
+
+def _tower_connect_url(mask_key=False):
+    """Base URL + ?deviceType=tower&droneId=<TOWER_ID>[&key=...] (unless already given)."""
+    if "deviceType=" in TOWER_WS_URL:
+        return TOWER_WS_URL
+    q = {"deviceType": "tower", "droneId": TOWER_ID}
+    if TOWER_KEY:
+        q["key"] = "***" if mask_key else TOWER_KEY
+    return TOWER_WS_URL + ("&" if "?" in TOWER_WS_URL else "?") + urllib.parse.urlencode(q)
+TOWER_TOKEN = os.environ.get('TOWER_TOKEN', '').strip()          # optional Bearer header
+TOWER_KEY = os.environ.get('TOWER_KEY', TOWER_TOKEN).strip()       # optional &key= query value
 TOWER_LISTEN = os.environ.get('TOWER_LISTEN', '1') != '0'
+# Listen-only by default: nothing is sent up the socket (no hello, telemetry or
+# command results). Telemetry still goes to TELEMETRY_PUSH_URL by POST.
+# TOWER_SEND=1 turns replies on the socket back on.
+TOWER_SEND = os.environ.get('TOWER_SEND', '0') == '1'
 
 _tower_ws = None
 _tower_out = queue.Queue(maxsize=200)   # outgoing messages; the sender thread drains it
@@ -582,7 +596,7 @@ def tower_send(obj):
     """Queue a JSON message for the tower socket. Never blocks and never raises:
     while the socket is down, messages are simply dropped (telemetry is sent
     again on the next update anyway), so the radio and dashboard never wait on it."""
-    if _tower_ws is None:
+    if not TOWER_SEND or _tower_ws is None:
         return False
     try:
         _tower_out.put_nowait(json.dumps(obj))
@@ -632,81 +646,175 @@ def _num_or_none(v):
         return None
 
 
+_SIMPLE_SERVER_CMDS = {
+    "ARM": "arm", "DISARM": "disarm", "LAND": "land", "STOP": "stop",
+    "ESTOP": "estop", "EMERGENCY_STOP": "estop", "E_STOP": "estop",
+    "RTL": "rtl", "RETURN": "rtl", "RETURN_TO_LAUNCH": "rtl",
+    "STATUS": "status", "PING": "ping", "SENSORS": "sensors", "TARE": "tare",
+    "SNAPSHOT": "snap", "SNAP": "snap", "RESET": "reset",
+    "START_TRACKING": "ys", "TRACK": "ys", "START": "ys", "YS": "ys",
+    "STOP_TRACKING": "yz", "YZ": "yz",
+}
+
+
+def _drone_number(drone_id):
+    """'DRONE-1' -> '1', 'drone_2' -> '2', '3' -> '3'; None if there is no number."""
+    m = re.search(r'(\d+)\s*$', str(drone_id or ""))
+    return m.group(1) if m else None
+
+
+def _server_command_to_lora(command, params):
+    """Translate one server command (+params) to the drone's text command, or raise ValueError."""
+    params = params if isinstance(params, dict) else {}
+    raw = str(command or "").strip()
+    if not raw:
+        raise ValueError("empty command")
+    name = raw.upper().replace("-", "_").replace(" ", "_")
+
+    def num(*keys):
+        for k in keys:
+            v = _num_or_none(params.get(k))
+            if v is not None:
+                return v
+        return None
+
+    if name in _SIMPLE_SERVER_CMDS:
+        return _SIMPLE_SERVER_CMDS[name]
+    if name == "TAKEOFF":
+        alt = num("altitude", "alt", "alt_m", "height")
+        if alt is None or alt <= 0:
+            raise ValueError("TAKEOFF needs params.altitude > 0")
+        return f"t {alt:g}"
+    if name in ("DESCEND", "DOWN"):
+        m = num("meters", "distance", "altitude", "alt")
+        if m is None or m <= 0:
+            raise ValueError("DESCEND needs params.meters > 0")
+        return f"d {m:g}"
+    if name in ("GOTO", "GO_TO", "GYS", "TARGET", "FLY_TO", "GOTO_TARGET"):
+        tgt = params.get("target") if isinstance(params.get("target"), dict) else params
+        lat = _num_or_none(tgt.get("lat", tgt.get("latitude")))
+        lon = _num_or_none(tgt.get("lon", tgt.get("lng", tgt.get("longitude"))))
+        alt = _num_or_none(tgt.get("altitude", tgt.get("alt", tgt.get("alt_m"))))
+        if lat is None or lon is None or abs(lat) > 90 or abs(lon) > 180:
+            raise ValueError(f"{name} needs params.lat and params.lon")
+        return f"gys {lat:.6f} {lon:.6f}" + (f" {alt:.1f}" if alt is not None else "")
+    if name == "SET_HOME":
+        lat, lon, alt = num("lat", "latitude"), num("lon", "lng", "longitude"), num("altitude", "alt")
+        if lat is None or lon is None:
+            return "sethome here"
+        return f"sethome {lat:.6f} {lon:.6f}" + (f" {alt:g}" if alt is not None else "")
+    if name == "AREA":
+        px = num("px", "area", "value")
+        if px is None:
+            raise ValueError("AREA needs params.px")
+        return f"area {px:g}"
+    if name in ("SET", "SET_PARAM"):
+        pname, val = params.get("name", params.get("param")), _num_or_none(params.get("value"))
+        if not pname or val is None:
+            raise ValueError("SET_PARAM needs params.name and params.value")
+        return f"set {pname} {val:g}"
+    if raw != raw.upper():           # lowercase / mixed text: pass straight through ("t 20")
+        return raw
+    raise ValueError(f"unsupported command {raw!r}")
+
+
 def tower_message_to_commands(raw):
-    """Turn one socket message into a list of (command, request_id) or raise ValueError."""
+    """Turn one socket message into a list of jobs {cmd, cmd_id, server_drone}.
+    Returns [] for messages that aren't commands; raises ValueError for bad commands."""
     try:
         msg = json.loads(raw)
     except (TypeError, ValueError):
-        # plain text: one command per line
-        return [(line.strip(), None) for line in str(raw).splitlines() if line.strip()]
+        # plain text: one '<id>-<command>' per line
+        return [{"cmd": line.strip(), "cmd_id": None, "server_drone": None}
+                for line in str(raw).splitlines() if line.strip()]
 
     if isinstance(msg, str):
-        return [(msg.strip(), None)] if msg.strip() else []
+        return [{"cmd": msg.strip(), "cmd_id": None, "server_drone": None}] if msg.strip() else []
     if isinstance(msg, list):
         out = []
         for m in msg:
             out += tower_message_to_commands(json.dumps(m))
         return out
     if not isinstance(msg, dict):
-        raise ValueError("unsupported message")
+        return []
 
     mtype = str(msg.get("type", "")).lower()
-    if mtype in ("ping", "pong", "heartbeat", "hello", "ack", "welcome", "connected"):
-        return []
-    req_id = msg.get("request_id", msg.get("id"))
-    drone = msg.get("drone_id", msg.get("drone", msg.get("droneId")))
-    drone = str(drone).strip() if drone is not None else None
 
-    # ---- target GPS -> gys ----
+    # Server handshake / keep-alive / broadcasts: not commands.
+    if mtype == "connected":
+        print(f"[TOWER] server handshake: droneId={msg.get('droneId')} deviceType={msg.get('deviceType')} "
+              f"authenticated={msg.get('authenticated')} id={msg.get('connectionId')}", flush=True)
+        return []
+    if mtype == "error":
+        print(f"[TOWER] server error: {msg.get('message') or msg.get('error') or msg}", flush=True)
+        return []
+    if "event" in msg or mtype in ("ping", "pong", "heartbeat", "hello", "ack", "welcome",
+                                  "subscribed", "registered", "command_ack"):
+        return []
+
+    cmd_id = msg.get("cmdId", msg.get("request_id", msg.get("id")))
+    server_drone = msg.get("droneId", msg.get("drone_id", msg.get("drone")))
+
+    # ---- Synaix protocol: execute_command / command ----
+    if mtype in ("execute_command", "command"):
+        num = _drone_number(server_drone)
+        if num is None:
+            raise ValueError(f"droneId {server_drone!r} has no drone number")
+        if str(server_drone).strip().lower() == TOWER_ID.lower():
+            raise ValueError(f"command addressed to this tower ({TOWER_ID}), not a drone")
+        lora = _server_command_to_lora(msg.get("command"), msg.get("params"))
+        return [{"cmd": f"{num}-{lora}", "cmd_id": cmd_id, "server_drone": server_drone}]
+
+    # ---- older/simple formats ----
+    drone = _drone_number(server_drone) if server_drone is not None else None
     tgt = msg.get("target") if isinstance(msg.get("target"), dict) else None
     if tgt is None and (mtype in ("target", "gps", "goto", "gys", "target_gps")
                         or ("lat" in msg and ("lon" in msg or "lng" in msg))):
         tgt = msg
     if tgt is not None and "command" not in msg and "cmd" not in msg:
-        lat = _num_or_none(tgt.get("lat", tgt.get("latitude")))
-        lon = _num_or_none(tgt.get("lon", tgt.get("lng", tgt.get("longitude"))))
-        alt = _num_or_none(tgt.get("alt", tgt.get("altitude", tgt.get("alt_m"))))
-        if lat is None or lon is None or abs(lat) > 90 or abs(lon) > 180:
-            raise ValueError("target needs valid lat and lon")
         if not drone:
-            raise ValueError("target needs drone_id")
-        cmd = f"{drone}-gys {lat:.6f} {lon:.6f}" + (f" {alt:.1f}" if alt is not None else "")
-        return [(cmd, req_id)]
+            raise ValueError("target needs droneId")
+        return [{"cmd": f"{drone}-" + _server_command_to_lora("GOTO", tgt),
+                 "cmd_id": cmd_id, "server_drone": server_drone}]
 
-    # ---- plain command ----
     cmd = msg.get("command", msg.get("cmd"))
     if not cmd:
-        raise ValueError("no command or target in message")
+        return []                       # nothing we understand: ignore quietly
     cmd = str(cmd).strip()
     if drone and not cmd.startswith(f"{drone}-"):
-        cmd = f"{drone}-{cmd}"
-    return [(cmd, req_id)]
+        cmd = f"{drone}-" + _server_command_to_lora(cmd, msg.get("params"))
+    return [{"cmd": cmd, "cmd_id": cmd_id, "server_drone": server_drone}]
 
 
-def _run_tower_command(cmd, req_id):
-    print(f"[TOWER] command from server: {cmd}", flush=True)
+def _run_tower_command(job):
+    cmd = job["cmd"]
+    print(f"[TOWER] command from server: {cmd}" + (f"  (cmdId {job['cmd_id']})" if job["cmd_id"] else ""),
+          flush=True)
     result, status = execute_command(cmd)
-    reply = {"type": "command_result", "tower_id": TOWER_ID, "request_id": req_id,
-             "command": cmd, "http_status": status}
-    reply.update(result)
-    tower_send(reply)
+    detail = result.get('response') or result.get('message') or result.get('error')
+    print(f"[TOWER] result: {cmd} -> {detail}", flush=True)
+    ok = status == 200 and result.get("status") == "success"
+    tower_send({"type": "command_ack", "cmdId": job["cmd_id"],
+                "droneId": job["server_drone"] or f"DRONE-{cmd.split('-', 1)[0]}",
+                "status": "completed" if ok else ("timeout" if status == 408 else "failed"),
+                "detail": detail})
 
 
 def _on_tower_message(ws, raw):
     try:
-        cmds = tower_message_to_commands(raw)
+        jobs = tower_message_to_commands(raw)
     except ValueError as e:
-        print(f"[TOWER] ignored message {str(raw)[:120]!r}: {e}", flush=True)
-        req_id = None
+        print(f"[TOWER] refused command {str(raw)[:160]!r}: {e}", flush=True)
         try:
-            req_id = json.loads(raw).get("request_id")
+            m = json.loads(raw)
+            tower_send({"type": "command_ack", "cmdId": m.get("cmdId"), "droneId": m.get("droneId"),
+                        "status": "failed", "detail": str(e)})
         except Exception:
             pass
-        tower_send({"type": "error", "tower_id": TOWER_ID, "request_id": req_id, "error": str(e)})
         return
-    for cmd, req_id in cmds:
+    for job in jobs:
         # own thread per command: a 4 s wait for one drone never blocks a LAND behind it
-        threading.Thread(target=_run_tower_command, args=(cmd, req_id), daemon=True).start()
+        threading.Thread(target=_run_tower_command, args=(job,), daemon=True).start()
 
 
 def _tower_loop():
@@ -722,7 +830,8 @@ def _tower_loop():
     threading.Thread(target=_tower_sender, daemon=True).start()
     backoff = 2
     attempt = 0
-    print(f"[TOWER] connecting to {TOWER_WS_URL} in the background (dashboard/radio don't wait for it)",
+    print(f"[TOWER] connecting to {_tower_connect_url(mask_key=True)} in the background "
+          f"(dashboard/radio don't wait for it)",
           flush=True)
     while True:
         attempt += 1
@@ -734,8 +843,8 @@ def _tower_loop():
             _tower_ws = ws
             state["was_connected"] = True
             backoff, attempt = 2, 0
-            print(f"[TOWER] connected to {TOWER_WS_URL}", flush=True)
-            tower_send({"type": "hello", "tower_id": TOWER_ID})
+            print(f"[TOWER] connected as {TOWER_ID} - listening for commands"
+                  + ("" if TOWER_SEND else " (listen-only)"), flush=True)
 
         def on_close(ws, code, reason):
             global _tower_ws
@@ -747,7 +856,7 @@ def _tower_loop():
             state["reason"] = _short_reason(err)
 
         try:
-            app_ws = websocket.WebSocketApp(TOWER_WS_URL, header=headers, on_open=on_open,
+            app_ws = websocket.WebSocketApp(_tower_connect_url(), header=headers, on_open=on_open,
                                             on_message=_on_tower_message, on_close=on_close,
                                             on_error=on_error)
             app_ws.run_forever(ping_interval=20, ping_timeout=10)
