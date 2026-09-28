@@ -211,13 +211,28 @@
                         <!-- Go to a GPS point with vision on, chase the first balloon seen -->
                         <div class="mt-1" id="tower-target" style="font-size: 0.75rem; opacity: 0.85;">TOWER TARGET: none yet</div>
                         <div class="cmd-grid-3 mt-1">
-                            <input type="number" step="0.000001" id="gys-lat" class="tactical-input" placeholder="LAT">
-                            <input type="number" step="0.000001" id="gys-lon" class="tactical-input" placeholder="LON">
-                            <input type="number" step="0.5" id="gys-alt" class="tactical-input" placeholder="ALT (opt)">
+                            <input type="number" step="0.000001" id="gys-lat" class="tactical-input" placeholder="LAT" value="50.251730">
+                            <input type="number" step="0.000001" id="gys-lon" class="tactical-input" placeholder="LON" value="-110.918257">
+                            <input type="number" step="0.5" id="gys-alt" class="tactical-input" placeholder="ALT (opt)" value="10">
                         </div>
                         <div class="cmd-grid-2 mt-1">
                             <button class="cmd-btn btn-primary" id="btn-gys">GO &amp; TRACK (GYS)</button>
                             <button class="cmd-btn" id="btn-gys-here">USE DRONE POS</button>
+                        </div>
+                        <!-- From my location: distance + compass direction -> fills the GO & TRACK fields -->
+                        <div class="mt-1" style="font-size: 0.75rem; opacity: 0.85;">FROM MY LOCATION (distance + direction)</div>
+                        <div class="cmd-grid-2 mt-1">
+                            <input type="number" step="0.000001" id="my-lat" class="tactical-input" placeholder="MY LAT" value="50.252019">
+                            <input type="number" step="0.000001" id="my-lon" class="tactical-input" placeholder="MY LON" value="-110.918796">
+                        </div>
+                        <div class="cmd-grid-2 mt-1">
+                            <input type="number" step="1" min="1" id="calc-dist" class="tactical-input" placeholder="DISTANCE (M)" value="50">
+                            <input type="text" id="calc-bearing" class="tactical-input" placeholder="DIRECTION (SW or 225)" value="130">
+                        </div>
+                        <div class="cmd-grid-3 mt-1">
+                            <button class="cmd-btn" id="btn-my-gps">MY GPS</button>
+                            <button class="cmd-btn" id="btn-my-tower">TOWER POS</button>
+                            <button class="cmd-btn btn-primary" id="btn-calc-goto">CALC &rarr; FILL</button>
                         </div>
                     </div>
 

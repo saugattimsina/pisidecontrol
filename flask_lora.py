@@ -701,8 +701,122 @@ def store_target(msg):
             "height_agl_m": t.get("height_above_ground_m"),
             "lock_type": t.get("lock_type"),
             "command": f"{TARGET_DRONE}-gys {lat:.6f} {lon:.6f} {alt:.1f}",
+            "tower": {"lat": _num_or_none((body.get("tower") or {}).get("lat")),
+                      "lon": _num_or_none((body.get("tower") or {}).get("lon"))},
         }
     return True
+
+
+# ----------------------------------------------------------------------------
+# Go-to from "my location + distance + compass direction"
+#   GET /calc-goto?lat=43.75861&lon=-79.42124&distance=120&bearing=SW&alt=20&drone=1
+#   bearing: degrees (0 = north, 90 = east) or a compass point (N, NNE, NE, ... NNW)
+#   -> {"lat", "lon", "alt", "bearing_deg", "distance_m", "command": "1-gys <lat> <lon> [alt]"}
+# Nothing is sent: the dashboard fills GO & TRACK and the operator clicks to send.
+# ----------------------------------------------------------------------------
+COMPASS_POINTS = {name: i * 22.5 for i, name in enumerate(
+    "N NNE NE ENE E ESE SE SSE S SSW SW WSW W WNW NW NNW".split())}
+CALC_MAX_DISTANCE_M = 1000.0
+
+
+def parse_bearing(value):
+    """'SW' -> 225.0, 'n' -> 0.0, '217.5' -> 217.5; raises ValueError."""
+    text = str(value or "").strip().upper().replace("°", "").replace("DEG", "").strip()
+    if text in COMPASS_POINTS:
+        return COMPASS_POINTS[text]
+    try:
+        deg = float(text)
+    except ValueError:
+        raise ValueError(f"bearing {value!r}: use degrees (0-360) or N, NE, SW, WNW ...")
+    if not (deg == deg) or deg < 0 or deg > 360:
+        raise ValueError("bearing must be 0-360 degrees")
+    return deg % 360.0
+
+
+def destination_point(lat, lon, distance_m, bearing_deg):
+    """Point reached by going distance_m from (lat, lon) along bearing_deg (great circle)."""
+    import math
+    R = 6371008.8
+    d = distance_m / R
+    b = math.radians(bearing_deg)
+    p1, l1 = math.radians(lat), math.radians(lon)
+    p2 = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(b))
+    l2 = l1 + math.atan2(math.sin(b) * math.sin(d) * math.cos(p1),
+                         math.cos(d) - math.sin(p1) * math.sin(p2))
+    return math.degrees(p2), (math.degrees(l2) + 540.0) % 360.0 - 180.0
+
+
+# ----------------------------------------------------------------------------
+# This computer's own GPS (for "MY GPS" on the dashboard)
+#   default: /dev/ttyACM0    the laptop's USB GPS (found with find_gps.py; baud auto-detected)
+#   MY_GPS=/dev/ttyUSB1      a different port
+#   MY_GPS=gpsd              read from gpsd
+#   MY_GPS=auto              scan serial ports (skips the LoRa module's port)
+#   MY_GPS=off               don't read a GPS (use this where ttyACM0 is something else,
+#                            e.g. a flight controller)
+# Run find_gps.py first to see which port the GPS is on.
+# ----------------------------------------------------------------------------
+MY_GPS = os.environ.get('MY_GPS', '/dev/ttyACM0').strip()
+my_gps = None
+
+
+def start_my_gps():
+    global my_gps
+    if not MY_GPS or MY_GPS.lower() in ("0", "off", "no"):
+        return
+    try:
+        import gps_reader
+    except ImportError:
+        print("[GPS] MY_GPS set but gps_reader.py is missing next to flask_lora.py", flush=True)
+        return
+    exclude = [SERIAL_PORT] if not _want_sx1262() else []
+    if MY_GPS.startswith("/dev/") and not os.path.exists(MY_GPS):
+        print(f"[GPS] {MY_GPS} not found - MY GPS button disabled (plug the GPS in, or set MY_GPS=...)",
+              flush=True)
+        return
+    if MY_GPS.startswith("/dev/") and not _want_sx1262() and \
+            os.path.realpath(MY_GPS) == os.path.realpath(SERIAL_PORT):
+        print(f"[GPS] {MY_GPS} is the LoRa module's port - not reading GPS there", flush=True)
+        return
+    my_gps = gps_reader.GpsReader(MY_GPS, exclude=exclude).start()
+    print(f"[GPS] reading this computer's GPS ({MY_GPS})", flush=True)
+
+
+@app.route('/my-location')
+def my_location():
+    """This computer's GPS fix, if MY_GPS is configured."""
+    if my_gps is None:
+        return jsonify({"available": False,
+                        "error": "no GPS configured - start Flask with MY_GPS=<port> (see find_gps.py)"})
+    s = my_gps.snapshot()
+    ok = bool(s["fix"] and s["lat"] is not None and (s["age_s"] is not None and s["age_s"] < 10))
+    return jsonify({"available": ok, "lat": s["lat"], "lon": s["lon"], "alt": s["alt"],
+                    "sats": s["sats"], "hdop": s["hdop"], "age_s": s["age_s"],
+                    "device": s["device"],
+                    "error": None if ok else (s["error"] or "GPS has no fix yet")})
+
+
+@app.route('/calc-goto', methods=['GET', 'POST'])
+def calc_goto():
+    args = request.get_json(silent=True) if request.method == 'POST' else None
+    args = args or request.values
+    try:
+        lat, lon = _num_or_none(args.get("lat")), _num_or_none(args.get("lon"))
+        if lat is None or lon is None or abs(lat) > 90 or abs(lon) > 180 or (lat == 0 and lon == 0):
+            raise ValueError("my location needs a valid lat and lon")
+        dist = _num_or_none(args.get("distance"))
+        if dist is None or dist <= 0 or dist > CALC_MAX_DISTANCE_M:
+            raise ValueError(f"distance must be between 0 and {CALC_MAX_DISTANCE_M:g} m")
+        bearing = parse_bearing(args.get("bearing"))
+        alt = _num_or_none(args.get("alt")) if str(args.get("alt", "")).strip() else None
+        drone = str(args.get("drone") or TARGET_DRONE).strip()
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    tlat, tlon = destination_point(lat, lon, dist, bearing)
+    cmd = f"{drone}-gys {tlat:.6f} {tlon:.6f}" + (f" {alt:.1f}" if alt is not None else "")
+    return jsonify({"lat": round(tlat, 7), "lon": round(tlon, 7), "alt": alt,
+                    "bearing_deg": bearing, "distance_m": dist, "from": {"lat": lat, "lon": lon},
+                    "command": cmd})
 
 
 @app.route('/target')
@@ -1127,6 +1241,7 @@ start_tower_listener = start_ws_links     # old name
 
 if __name__ == '__main__':
     ensure_radio()
+    start_my_gps()
     start_ws_links()
     # threaded=True so an emergency LAND request isn't stuck behind a poll request.
     app.run(host='0.0.0.0', port=5000, threaded=True)

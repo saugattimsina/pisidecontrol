@@ -333,6 +333,85 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     setTimeout(pollTowerTarget, 1500);
 
+    // FROM MY LOCATION: my lat/lon + distance + compass direction -> Python (/calc-goto)
+    // computes the point and fills the GO & TRACK fields. Nothing is sent until GO & TRACK.
+    const myLat = document.getElementById('my-lat');
+    const myLon = document.getElementById('my-lon');
+    try {                                             // remember my location between visits
+        const saved = JSON.parse(localStorage.getItem('pilora-my-loc') || 'null');
+        if (saved && myLat && myLon && !myLat.value && !myLon.value) { myLat.value = saved.lat; myLon.value = saved.lon; }
+    } catch (e) { /* storage unavailable: fine */ }
+    function saveMyLoc() {
+        try { localStorage.setItem('pilora-my-loc', JSON.stringify({ lat: myLat.value, lon: myLon.value })); }
+        catch (e) { /* ignore */ }
+    }
+    myLat?.addEventListener('change', saveMyLoc);
+    myLon?.addEventListener('change', saveMyLoc);
+
+    document.getElementById('btn-my-gps')?.addEventListener('click', async () => {
+        // 1) the GPS plugged into the computer running Flask (MY_GPS=...)
+        try {
+            const g = await (await fetch('/my-location')).json();
+            if (g.available) {
+                myLat.value = Number(g.lat).toFixed(6);
+                myLon.value = Number(g.lon).toFixed(6);
+                saveMyLoc();
+                log(`LOC // GPS ${g.device}: ${myLat.value}, ${myLon.value} (${g.sats} sats, hdop ${g.hdop})`, 'system');
+                return;
+            }
+            if (g.error && !g.error.startsWith('no GPS configured')) {
+                log(`ERR: GPS ${g.error}`, 'error');
+                return;
+            }
+        } catch (e) { /* fall through to the browser */ }
+        // 2) the browser's own location (only on https:// or localhost)
+        if (!navigator.geolocation || !window.isSecureContext) {
+            log('ERR: BROWSER GPS NEEDS https:// OR localhost - TYPE MY LAT/LON OR USE TOWER POS', 'error');
+            return;
+        }
+        log('LOC // asking browser for GPS position...', 'system');
+        navigator.geolocation.getCurrentPosition(pos => {
+            myLat.value = pos.coords.latitude.toFixed(6);
+            myLon.value = pos.coords.longitude.toFixed(6);
+            saveMyLoc();
+            log(`LOC // my position ${myLat.value}, ${myLon.value} (±${Math.round(pos.coords.accuracy)} m)`, 'system');
+        }, err => log(`ERR: GPS ${err.message}`, 'error'), { enableHighAccuracy: true, timeout: 15000 });
+    });
+
+    document.getElementById('btn-my-tower')?.addEventListener('click', async () => {
+        try {
+            const t = (await (await fetch('/target')).json()).target;
+            if (!t || !t.tower || t.tower.lat == null) { log('ERR: NO TOWER POSITION YET (needs a tower lock)', 'error'); return; }
+            myLat.value = Number(t.tower.lat).toFixed(6);
+            myLon.value = Number(t.tower.lon).toFixed(6);
+            saveMyLoc();
+            log(`LOC // using tower position ${myLat.value}, ${myLon.value}`, 'system');
+        } catch (e) { log('ERR: RELAY OFFLINE', 'error'); }
+    });
+
+    document.getElementById('btn-calc-goto')?.addEventListener('click', async () => {
+        const params = new URLSearchParams({
+            lat: myLat.value, lon: myLon.value,
+            distance: document.getElementById('calc-dist').value,
+            bearing: document.getElementById('calc-bearing').value,
+            alt: document.getElementById('gys-alt').value,
+            drone: currentDroneId,
+        });
+        try {
+            const r = await fetch('/calc-goto?' + params.toString());
+            const d = await r.json();
+            if (!r.ok) { log(`ERR: ${d.error}`, 'error'); return; }
+            document.getElementById('gys-lat').value = d.lat.toFixed(6);
+            document.getElementById('gys-lon').value = d.lon.toFixed(6);
+            ['gys-lat', 'gys-lon'].forEach(id => {
+                const el = document.getElementById(id);
+                el.style.outline = '2px solid #00ccff';
+                setTimeout(() => { el.style.outline = ''; }, 1500);
+            });
+            log(`CALC // ${d.distance_m} m at ${d.bearing_deg}° from me -> ${d.command} - click GO & TRACK to send`, 'system');
+        } catch (e) { log('ERR: RELAY OFFLINE', 'error'); }
+    });
+
     // Copy the drone's last reported position into the GYS fields (handy for tweaking)
     document.getElementById('btn-gys-here')?.addEventListener('click', () => {
         const loc = telLoc.textContent;
