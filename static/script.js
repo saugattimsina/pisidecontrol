@@ -295,6 +295,44 @@ document.addEventListener('DOMContentLoaded', () => {
         sendUserCommand(`gys ${lat.toFixed(6)} ${lon.toFixed(6)}${alt}`);
     });
 
+    // TOWER TARGET: when the tower locks a target (target_locked over the WebSocket),
+    // fill the GO & TRACK fields. Nothing is sent until the operator clicks GO & TRACK.
+    let lastTargetSeq = 0;
+    const towerTargetEl = document.getElementById('tower-target');
+    async function pollTowerTarget() {
+        try {
+            const r = await fetch('/target');
+            const data = await r.json();
+            const t = data.target;
+            if (t && towerTargetEl) {
+                const info = `TOWER TARGET: ${t.lat.toFixed(6)}, ${t.lon.toFixed(6)} @ ${t.alt} m` +
+                    (t.distance_m != null ? ` | ${t.distance_m} m ${t.compass || ''} of tower` : '') +
+                    (t.confidence != null ? ` | conf ${Number(t.confidence).toFixed(2)}` : '') +
+                    ` | ${t.age_s}s ago`;
+                towerTargetEl.textContent = info;
+                towerTargetEl.style.color = t.age_s > 10 ? '#888' : '#ffcc00';
+            }
+            if (t && t.seq !== lastTargetSeq) {
+                lastTargetSeq = t.seq;
+                const ids = ['gys-lat', 'gys-lon', 'gys-alt'];
+                const typing = ids.includes(document.activeElement?.id);   // don't overwrite while editing
+                if (!typing) {
+                    document.getElementById('gys-lat').value = t.lat.toFixed(6);
+                    document.getElementById('gys-lon').value = t.lon.toFixed(6);
+                    document.getElementById('gys-alt').value = t.alt.toFixed(1);
+                    ids.forEach(id => {
+                        const el = document.getElementById(id);
+                        el.style.outline = '2px solid #ffcc00';
+                        setTimeout(() => { el.style.outline = ''; }, 1500);
+                    });
+                }
+                log(`TARGET // tower lock ready: ${t.command} - click GO & TRACK to send`, 'system');
+            }
+        } catch (e) { /* relay offline: the poll loop reports that */ }
+        setTimeout(pollTowerTarget, 1000);
+    }
+    setTimeout(pollTowerTarget, 1500);
+
     // Copy the drone's last reported position into the GYS fields (handy for tweaking)
     document.getElementById('btn-gys-here')?.addEventListener('click', () => {
         const loc = telLoc.textContent;

@@ -181,6 +181,8 @@ def record_line(line, rssi=None, snr=None):
             st["goto"] = {"active": "Go" in f, "remaining_m": _num(f["Go"], "m") if "Go" in f else None}
         if keyword and not f:
             events.append({"at": now, "drone_id": drone_id, "command": keyword, "text": text})
+        if keyword == "gys" and text and text.upper().startswith("BALLOON SEEN"):
+            _chasing_until[drone_id] = time.time() + TARGET_HOLDOFF_S   # its own camera has it now
         if keyword == "gys" and text and not text.startswith("OK"):
             st["goto"] = {"active": False, "remaining_m": None}   # ARRIVED / BALLOON SEEN / TIMEOUT
         snapshot = json.loads(json.dumps(st))
@@ -587,6 +589,157 @@ WS_POLL_S = float(os.environ.get('WS_POLL_S', '3'))
 WS_TOWER = os.environ.get('WS_TOWER', '0') == '1'
 TOWER_ID = os.environ.get('TOWER_ID', 'Tower-1')
 WS_ENABLE = os.environ.get('WS_ENABLE', os.environ.get('TOWER_LISTEN', '1')) != '0'
+
+# ---- "target_locked" events from the tower camera ----
+# Default (manual): the latest lock is stored and shown on the dashboard's GO & TRACK
+# box (GET /target); nothing is sent to a drone until the operator clicks the button.
+#   WS_TARGET_AUTO=1            send the go-to automatically instead (rate-limited, below)
+#   WS_TARGET_DRONE=1           which drone is sent after the target (default: first of WS_DRONES)
+#   WS_TARGET_POINT=estimated   use target.estimated_gps, or "predicted" for predicted_trajectory.predicted_gps
+#   WS_TARGET_ALT_BELOW=5       fly this many metres BELOW the balloon (the camera looks up)
+#   WS_TARGET_ALT_MIN=3 / WS_TARGET_ALT_MAX=60   clamp the go-to altitude
+#   WS_TARGET_MIN_CONF=0.5      ignore locks with lower confidence
+#   WS_TARGET_MIN_MOVE_M=10     only re-send when the target moved this far...
+#   WS_TARGET_REFRESH_S=15      ...or this long passed since the last send
+#   WS_TARGET_MIN_GAP_S=3       never send more often than this (LoRa airtime)
+#   WS_TARGET_HOLDOFF_S=20      after the drone reports "BALLOON SEEN", stop sending go-tos
+#                               for this long so the chase isn't interrupted
+TARGET_AUTO = os.environ.get('WS_TARGET_AUTO', '0') == '1'
+TARGET_DRONE = os.environ.get('WS_TARGET_DRONE', WS_DRONES[0] if WS_DRONES else '1')
+TARGET_POINT = os.environ.get('WS_TARGET_POINT', 'estimated').lower()
+TARGET_ALT_BELOW = float(os.environ.get('WS_TARGET_ALT_BELOW', '5'))
+TARGET_ALT_MIN = float(os.environ.get('WS_TARGET_ALT_MIN', '3'))
+TARGET_ALT_MAX = float(os.environ.get('WS_TARGET_ALT_MAX', '60'))
+TARGET_MIN_CONF = float(os.environ.get('WS_TARGET_MIN_CONF', '0.5'))
+TARGET_MIN_MOVE_M = float(os.environ.get('WS_TARGET_MIN_MOVE_M', '10'))
+TARGET_REFRESH_S = float(os.environ.get('WS_TARGET_REFRESH_S', '15'))
+TARGET_MIN_GAP_S = float(os.environ.get('WS_TARGET_MIN_GAP_S', '3'))
+TARGET_HOLDOFF_S = float(os.environ.get('WS_TARGET_HOLDOFF_S', '20'))
+
+_chasing_until = {}           # drone number -> time until which go-tos are suppressed
+latest_target = None          # last target_locked, ready for the dashboard (GET /target)
+_latest_target_seq = 0
+_last_target_sent = {}        # drone number -> (time, lat, lon, alt)
+_target_lock = threading.Lock()
+
+
+def _offset_m(lat1, lon1, lat2, lon2):
+    import math
+    n = (lat2 - lat1) * 111320.0
+    e = (lon2 - lon1) * 111320.0 * math.cos(math.radians(lat1))
+    return math.hypot(n, e)
+
+
+def target_event_to_goto(msg):
+    """Parse a target_locked event -> (lat, lon, alt, note) or (None, reason)."""
+    body = msg.get("data") if isinstance(msg.get("data"), dict) and "target" in msg["data"] else msg
+    t = body.get("target")
+    if not isinstance(t, dict):
+        return None, "no target object"
+    if t.get("locked") is False:
+        return None, "target not locked"
+    conf = _num_or_none(t.get("confidence"))
+    if conf is not None and conf < TARGET_MIN_CONF:
+        return None, f"confidence {conf:.2f} < {TARGET_MIN_CONF}"
+
+    point, which = None, "estimated_gps"
+    if TARGET_POINT.startswith("pred"):
+        pt = (t.get("predicted_trajectory") or {}).get("predicted_gps")
+        if isinstance(pt, dict):
+            point, which = pt, "predicted_gps"
+    if point is None:
+        point = t.get("estimated_gps") if isinstance(t.get("estimated_gps"), dict) else None
+    if point is None:
+        return None, "no estimated_gps"
+    lat, lon = _num_or_none(point.get("lat")), _num_or_none(point.get("lon"))
+    if lat is None or lon is None or abs(lat) > 90 or abs(lon) > 180 or (lat == 0 and lon == 0):
+        return None, "bad target lat/lon"
+
+    # Height above the ground at the tower ~= height above the drone's take-off point.
+    tower = body.get("tower") if isinstance(body.get("tower"), dict) else {}
+    tower_h = _num_or_none(tower.get("height_m")) or 0.0
+    h = None
+    if which == "predicted_gps" and _num_or_none(point.get("height_m")) is not None:
+        h = _num_or_none(point.get("height_m")) + tower_h      # predicted height is relative to the camera
+    if h is None:
+        h = _num_or_none(t.get("height_above_ground_m"))
+    if h is None:
+        h = _num_or_none(point.get("height_m"))
+    if h is None:
+        h = _num_or_none(t.get("height_m"))
+    if h is None:
+        return None, "no target height"
+    alt = min(max(h - TARGET_ALT_BELOW, TARGET_ALT_MIN), TARGET_ALT_MAX)
+    note = (f"{which}, balloon {h:.1f} m AGL -> fly at {alt:.1f} m"
+            + (f", conf {conf:.2f}" if conf is not None else "")
+            + (f", {t.get('distance_m')} m from tower" if t.get('distance_m') is not None else ""))
+    return (lat, lon, alt, note), None
+
+
+def store_target(msg):
+    """Keep the latest lock for the dashboard. Returns True if it was usable."""
+    global latest_target, _latest_target_seq
+    res, why = target_event_to_goto(msg)
+    if res is None:
+        print(f"[TARGET] ignored target_locked: {why}", flush=True)
+        return False
+    lat, lon, alt, note = res
+    body = msg.get("data") if isinstance(msg.get("data"), dict) and "target" in msg["data"] else msg
+    t = body.get("target") or {}
+    with _target_lock:
+        _latest_target_seq += 1
+        latest_target = {
+            "seq": _latest_target_seq,
+            "received_at": _now_iso(),
+            "event_time": body.get("timestamp", msg.get("timestamp")),
+            "drone": TARGET_DRONE,
+            "lat": round(lat, 7), "lon": round(lon, 7), "alt": round(alt, 1),
+            "note": note,
+            "confidence": t.get("confidence"),
+            "distance_m": t.get("distance_m"),
+            "compass": t.get("compass"),
+            "height_agl_m": t.get("height_above_ground_m"),
+            "lock_type": t.get("lock_type"),
+            "command": f"{TARGET_DRONE}-gys {lat:.6f} {lon:.6f} {alt:.1f}",
+        }
+    return True
+
+
+@app.route('/target')
+def target_latest():
+    """Latest tower target lock, for the dashboard to fill the GO & TRACK box."""
+    with _target_lock:
+        t = dict(latest_target) if latest_target else None
+    if t is None:
+        return jsonify({"target": None})
+    age = (datetime.now(timezone.utc) - datetime.fromisoformat(t["received_at"])).total_seconds()
+    t["age_s"] = round(age, 1)
+    return jsonify({"target": t})
+
+
+def target_job_for(drone_num, msg):
+    """Rate-limited gys job for a target_locked event, or None."""
+    res, why = target_event_to_goto(msg)
+    if res is None:
+        print(f"[TARGET] ignored target_locked: {why}", flush=True)
+        return None
+    lat, lon, alt, note = res
+    now = time.time()
+    with _target_lock:
+        if now < _chasing_until.get(drone_num, 0):
+            return None                       # drone's own camera has it: don't interrupt the chase
+        last = _last_target_sent.get(drone_num)
+        if last:
+            t0, la0, lo0, al0 = last
+            moved = max(_offset_m(la0, lo0, lat, lon), abs(alt - al0))
+            if now - t0 < TARGET_MIN_GAP_S:
+                return None
+            if moved < TARGET_MIN_MOVE_M and now - t0 < TARGET_REFRESH_S:
+                return None
+        _last_target_sent[drone_num] = (now, lat, lon, alt)
+    print(f"[TARGET] lock -> drone {drone_num}: {lat:.6f},{lon:.6f} @ {alt:.1f} m ({note})", flush=True)
+    return {"cmd": f"{drone_num}-gys {lat:.6f} {lon:.6f} {alt:.1f}", "cmd_id": None,
+            "server_drone": None, "kind": "target"}
 WS_TOKEN = os.environ.get('TOWER_TOKEN', '').strip()     # optional Bearer header
 
 def _short_reason(err):
@@ -767,6 +920,14 @@ class DeviceSocket:
         if mtype == "error":
             print(f"{self.tag} server error: {msg.get('message') or msg.get('error') or msg}", flush=True)
             return []
+        if str(msg.get("event", "")).lower() == "target_locked":
+            if self.drone_num is None or self.drone_num != TARGET_DRONE:
+                return []                    # only the designated drone's socket acts on it
+            ok = store_target(msg)           # shown on the dashboard; operator clicks to send
+            if ok and TARGET_AUTO:
+                job = target_job_for(self.drone_num, msg)
+                return [job] if job else []
+            return []
         if "event" in msg or mtype not in ("execute_command", "command", ""):
             return []                    # broadcasts, pong, acks...: not for us
 
@@ -792,6 +953,10 @@ class DeviceSocket:
         detail = result.get('response') or result.get('message') or result.get('error')
         print(f"{self.tag} result: {cmd} -> {detail}", flush=True)
         ok = status == 200 and result.get("status") == "success"
+        if job.get("kind") == "target":
+            if detail and "REJECTED" in str(detail):
+                print(f"{self.tag} drone refused the go-to: {detail}", flush=True)
+            return
         self.send({"type": "command_ack", "cmdId": job["cmd_id"],
                    "droneId": job["server_drone"] or self.device_id,
                    "status": "completed" if ok else ("timeout" if status == 408 else "failed"),
