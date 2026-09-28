@@ -539,7 +539,8 @@ def send_command():
 # also streamed up the socket.
 #
 #   TOWER_ID=TWR-01            (default)
-#   TOWER_WS_URL=wss://...     (default: wss://api.synaix.viclyx.com/api/towers/<TOWER_ID>/telemetry)
+#   TOWER_WS_URL=wss://...     (default: wss://api.synaix.viclyx.com/ws;
+#                               https:// and http:// are converted to wss:// and ws://)
 #   TOWER_TOKEN=secret         (optional, sent as "Authorization: Bearer secret")
 #   TOWER_LISTEN=0             (disable the listener)
 #
@@ -559,8 +560,17 @@ def send_command():
 #   {"type": "error", "tower_id", "request_id", "error"}
 # ----------------------------------------------------------------------------
 TOWER_ID = os.environ.get('TOWER_ID', 'TWR-01')
-TOWER_WS_URL = os.environ.get(
-    'TOWER_WS_URL', f'wss://api.synaix.viclyx.com/api/towers/{TOWER_ID}/telemetry')
+def _ws_url(url):
+    """WebSockets use ws:// / wss://; accept http(s):// too and convert."""
+    url = url.strip()
+    if url.startswith("https://"):
+        return "wss://" + url[len("https://"):]
+    if url.startswith("http://"):
+        return "ws://" + url[len("http://"):]
+    return url
+
+
+TOWER_WS_URL = _ws_url(os.environ.get('TOWER_WS_URL', 'wss://api.synaix.viclyx.com/ws'))
 TOWER_TOKEN = os.environ.get('TOWER_TOKEN', '').strip()
 TOWER_LISTEN = os.environ.get('TOWER_LISTEN', '1') != '0'
 
