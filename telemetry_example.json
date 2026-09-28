@@ -1,0 +1,47 @@
+{
+  "server_time": "2026-09-28T05:53:11.694+00:00",
+  "drones": {
+    "1": {
+      "drone_id": "1",
+      "online": true,
+      "age_s": 1.0,
+      "updated_at": "2026-09-28T05:53:10.683+00:00",
+      "armed": true,
+      "mode": "GUIDED",
+      "altitude_m": 20.1,
+      "baro_altitude_m": 19.8,
+      "ground_speed_ms": 3.2,
+      "climb_rate_ms": -0.4,
+      "gps": {
+        "enabled": true,
+        "fix": true,
+        "satellites": 12,
+        "lat": 43.75861,
+        "lon": -79.42124
+      },
+      "tracking": true,
+      "goto": {
+        "active": true,
+        "remaining_m": 85.0
+      },
+      "link": {
+        "rssi_dbm": -40.0,
+        "snr_db": 9.0
+      },
+      "last_reply": {
+        "command": "ping",
+        "text": "PONG",
+        "at": "2026-09-28T05:53:10.683+00:00"
+      },
+      "raw": "[Drone 1] ping: PONG|A:Y|M:GUIDED|Alt:20.1m|Spd:3.2|Vz:-0.4|Sats:12|Loc:43.758610,-79.421240|Trk:Y|Go:85m"
+    }
+  },
+  "events": [
+    {
+      "at": "2026-09-28T05:53:09.120+00:00",
+      "drone_id": "1",
+      "command": "arm",
+      "text": "OK armed"
+    }
+  ]
+}

@@ -1,3 +1,4 @@
 pyserial
 Flask
 LoRaRF
+websocket-client
