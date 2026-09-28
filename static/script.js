@@ -29,6 +29,8 @@ document.addEventListener('DOMContentLoaded', () => {
         telMode.textContent = '--';
         telAlt.textContent = '--';
         telBaro.textContent = '--';
+        telSpeed.textContent = '--';
+        telVz.textContent = '--';
         telSats.textContent = '--';
         telLoc.textContent = '--';
         telGpsLock.textContent = 'WAITING';
@@ -47,6 +49,8 @@ document.addEventListener('DOMContentLoaded', () => {
     const telAlt = document.getElementById('tel-alt');
     const telBaro = document.getElementById('tel-baro');
     const telSats = document.getElementById('tel-sats');
+    const telSpeed = document.getElementById('tel-speed');
+    const telVz = document.getElementById('tel-vz');
     const telLoc = document.getElementById('tel-loc');
     const telGpsLock = document.getElementById('tel-gps-lock');
     
@@ -92,6 +96,8 @@ document.addEventListener('DOMContentLoaded', () => {
         
         if (data.Alt) telAlt.textContent = data.Alt;
         if (data.Baro) telBaro.textContent = data.Baro;
+        if (data.Spd) telSpeed.textContent = `${data.Spd} m/s`;
+        if (data.Vz) telVz.textContent = `${parseFloat(data.Vz) > 0 ? '+' : ''}${data.Vz} m/s`;
         
         if (data.Sats) {
             telSats.textContent = data.Sats;
@@ -103,7 +109,15 @@ document.addEventListener('DOMContentLoaded', () => {
                 telGpsLock.className = 'tel-val text-red';
             }
         }
-        if (data.Loc) telLoc.textContent = data.Loc;
+        if (data.Loc) telLoc.textContent = data.Loc === 'none' ? 'NO FIX' : data.Loc;
+
+        // Drone running with --no-gps: it sends "GPS:OFF" instead of Sats/Loc
+        if (data.GPS === 'OFF') {
+            telSats.textContent = '--';
+            telLoc.textContent = 'GPS OFF';
+            telGpsLock.textContent = 'NO-GPS MODE';
+            telGpsLock.className = 'tel-val';
+        }
         
         // If your C++ string sends battery like "Bat:95", we parse it here:
         if (data.Bat) {
@@ -120,8 +134,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const fullCmd = `${currentDroneId}-${commandAction}`;
         
         spinner.classList.remove('hidden');
-        // Never disable the red LAND buttons while waiting for a reply.
-        document.querySelectorAll('.cmd-btn:not(.btn-danger)').forEach(b => b.disabled = true);
+        document.querySelectorAll('.cmd-btn').forEach(b => b.disabled = true);
         
         log(`TX // ${fullCmd}`, 'tx');
 
@@ -137,8 +150,6 @@ document.addEventListener('DOMContentLoaded', () => {
             if (response.ok) {
                 log(`RX // ${data.response}`, 'rx');
                 parseTelemetry(data.response);
-            } else if (response.status === 409) {
-                log(`SKIPPED // ${data.message}`, 'error');
             } else if (response.status === 408) {
                 log(`ERR // TIMEOUT - NO RESPONSE FROM C-${currentDroneId}`, 'error');
             } else {
@@ -155,59 +166,76 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // BACKGROUND LINK CHECK: ping the selected drone every 4 s.
-    // Pings are LOW priority on the server: they are skipped (409) whenever a
-    // real command is using the radio, and never delay one.
-    const PING_INTERVAL_MS = 4000;
-    const OFFLINE_AFTER_MISSES = 2;
-    const missCount = {};
+    // BACKGROUND AUTO-POLLING LOOP
     let isPolling = false;
-
-    function setBadge(droneId, text, cls) {
-        const badge = document.querySelector(`.asset-item[data-id="${droneId}"] .asset-status`);
-        if (badge) {
-            badge.textContent = text;
-            badge.className = `asset-status ${cls}`;
-        }
-    }
-
-    async function pingSelectedDrone() {
-        if (isPolling || isTransmittingManual || !currentDroneId) {
-            setTimeout(pingSelectedDrone, PING_INTERVAL_MS);
+    async function pollMainDrone() {
+        if (isPolling) return;
+        
+        // If the user just clicked a manual command (like ARM), skip this polling cycle
+        // so we don't jam the LoRa module with status requests!
+        if (isTransmittingManual) {
+            setTimeout(pollMainDrone, 1000);
             return;
         }
+        
         isPolling = true;
-        const droneId = currentDroneId;
+
+        const droneId = currentDroneId; // Only poll the currently selected main drone
+        
+        if (!droneId) {
+            isPolling = false;
+            setTimeout(pollMainDrone, 1000);
+            return;
+        }
 
         try {
+            // Send the status request quietly in the background
             const response = await fetch('/send', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cmd: `${droneId}-ping` })
+                body: JSON.stringify({ cmd: `${droneId}-ping` })   // ping reply carries A/M/Alt/GPS/Trk
             });
-            const data = await response.json();
 
-            if (response.status === 409) {
-                // Skipped because a real command had the radio - not a failure.
-            } else if (response.ok && data.response && data.response.includes('PONG')) {
-                missCount[droneId] = 0;
-                const armed = data.response.includes('A:Y');
-                const rtt = data.rtt_ms ? ` ${(data.rtt_ms / 1000).toFixed(1)}s` : '';
-                setBadge(droneId, (armed ? 'FLYING' : 'ONLINE') + rtt,
-                         armed ? 'status-flying' : 'status-standby');
-                if (droneId === currentDroneId) parseTelemetry(data.response);
+            const data = await response.json();
+            
+            // Locate this drone in the left Asset Roster panel
+            const assetItem = document.querySelector(`.asset-item[data-id="${droneId}"]`);
+            const statusBadge = assetItem?.querySelector('.asset-status');
+
+            if (response.ok && data.response) {
+                const payloadStr = data.response.split('] ')[1];
+                if (payloadStr) {
+                    // Check armed state to decide if flying or standby
+                    const isArmed = payloadStr.includes('A:Y');
+                    if (statusBadge) {
+                        statusBadge.textContent = isArmed ? 'FLYING' : 'STANDBY';
+                        statusBadge.className = `asset-status ${isArmed ? 'status-flying' : 'status-standby'}`;
+                    }
+                    
+                    // Because we only poll the current drone, we can safely update the dashboard
+                    parseTelemetry(data.response);
+                }
             } else {
-                missCount[droneId] = (missCount[droneId] || 0) + 1;
-                if (missCount[droneId] >= OFFLINE_AFTER_MISSES) {
-                    setBadge(droneId, 'OFFLINE', 'status-offline');
+                // Timeout or error: Mark offline
+                if (statusBadge) {
+                    statusBadge.textContent = 'OFFLINE';
+                    statusBadge.className = 'asset-status status-offline';
                 }
             }
         } catch (error) {
-            setBadge(droneId, 'OFFLINE', 'status-offline');
+            // Network failure
+            const assetItem = document.querySelector(`.asset-item[data-id="${droneId}"]`);
+            if (assetItem) {
+                const statusBadge = assetItem.querySelector('.asset-status');
+                statusBadge.textContent = 'OFFLINE';
+                statusBadge.className = 'asset-status status-offline';
+            }
         }
-
+        
         isPolling = false;
-        setTimeout(pingSelectedDrone, PING_INTERVAL_MS);
+        // Wait before querying again. The drone radio is half-duplex and each poll
+        // makes it transmit twice (ACK + telemetry), so polling too fast drops commands.
+        setTimeout(pollMainDrone, 2500);
     }
 
     // Button Bindings
@@ -217,27 +245,8 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     });
 
-    // Emergency broadcast: every drone on the channel lands (no replies awaited).
-    document.getElementById('btn-land-all')?.addEventListener('click', async () => {
-        log('TX // all-land (BROADCAST)', 'tx');
-        try {
-            const response = await fetch('/send', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cmd: 'all-land' })
-            });
-            const data = await response.json();
-            log(response.ok ? `RX // ${data.response}` : `ERR // ${data.error || 'BROADCAST FAILED'}`,
-                response.ok ? 'rx' : 'error');
-        } catch (error) {
-            log('ERR // OFFLINE - FAILED TO CONNECT TO RELAY', 'error');
-        }
-    });
-
     document.getElementById('btn-takeoff')?.addEventListener('click', () => {
-        // Max 65 m: matches the drone's alt_safe_max (fence is 70 m).
-        const MAX_TAKEOFF_M = 65;
-        const alt = Math.min(Number(document.getElementById('takeoff-alt').value) || 5, MAX_TAKEOFF_M);
+        const alt = document.getElementById('takeoff-alt').value || "20";
         sendUserCommand(`t ${alt}`);
     });
 
@@ -249,6 +258,50 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('btn-area')?.addEventListener('click', () => {
         const px = document.getElementById('area-px').value || "3000";
         sendUserCommand(`area ${px}`);
+    });
+
+    // LAND ALL: send land to every drone at once. Requests go out in parallel;
+    // flask_lora.py lets land jump the serial queue, so none waits on another's reply.
+    document.getElementById('btn-land-all')?.addEventListener('click', async () => {
+        isTransmittingManual = true;
+        drones.forEach(id => log(`TX // ${id}-land`, 'tx'));
+        const results = await Promise.allSettled(drones.map(id =>
+            fetch('/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ cmd: `${id}-land` })
+            }).then(r => r.json())
+        ));
+        results.forEach((r, i) => {
+            if (r.status === 'fulfilled' && !r.value.error) {
+                log(`RX // C-${drones[i]}: ${r.value.response || r.value.message || 'sent'}`, 'rx');
+            } else {
+                log(`ERR // C-${drones[i]} LAND NOT CONFIRMED - RESEND OR USE RC`, 'error');
+            }
+        });
+        setTimeout(() => { isTransmittingManual = false; }, 500);
+    });
+
+    // GO & TRACK: fly to a GPS point with vision on, chase the first balloon seen
+    document.getElementById('btn-gys')?.addEventListener('click', () => {
+        const lat = parseFloat(document.getElementById('gys-lat').value);
+        const lon = parseFloat(document.getElementById('gys-lon').value);
+        const altStr = document.getElementById('gys-alt').value.trim();
+        if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+            log('ERR: GYS NEEDS VALID LAT AND LON', 'error');
+            return;
+        }
+        const alt = altStr !== '' && isFinite(parseFloat(altStr)) ? ` ${parseFloat(altStr).toFixed(1)}` : '';
+        sendUserCommand(`gys ${lat.toFixed(6)} ${lon.toFixed(6)}${alt}`);
+    });
+
+    // Copy the drone's last reported position into the GYS fields (handy for tweaking)
+    document.getElementById('btn-gys-here')?.addEventListener('click', () => {
+        const loc = telLoc.textContent;
+        if (!loc.includes(',')) { log('ERR: NO DRONE POSITION YET', 'error'); return; }
+        const [la, lo] = loc.split(',');
+        document.getElementById('gys-lat').value = la.trim();
+        document.getElementById('gys-lon').value = lo.trim();
     });
 
     document.getElementById('btn-set-param')?.addEventListener('click', () => {
@@ -264,5 +317,5 @@ document.addEventListener('DOMContentLoaded', () => {
     // Init
     selectAsset("1", "C-1");
     // Start the endless background loop for the main drone
-    setTimeout(pingSelectedDrone, 1000);
+    setTimeout(pollMainDrone, 1000);
 });

@@ -93,6 +93,14 @@
                         <span class="tel-val" id="tel-baro">--</span>
                     </div>
                     <div class="tel-box">
+                        <span class="tel-label">GND SPEED</span>
+                        <span class="tel-val" id="tel-speed">--</span>
+                    </div>
+                    <div class="tel-box">
+                        <span class="tel-label">CLIMB RATE</span>
+                        <span class="tel-val" id="tel-vz">--</span>
+                    </div>
+                    <div class="tel-box">
                         <span class="tel-label">ARMED STATE</span>
                         <span class="tel-val" id="tel-armed">--</span>
                     </div>
@@ -200,6 +208,16 @@
                                 <input type="number" id="area-px" value="3000" class="tactical-input" placeholder="PX">
                             </div>
                         </div>
+                        <!-- Go to a GPS point with vision on, chase the first balloon seen -->
+                        <div class="cmd-grid-3 mt-1">
+                            <input type="number" step="0.000001" id="gys-lat" class="tactical-input" placeholder="LAT">
+                            <input type="number" step="0.000001" id="gys-lon" class="tactical-input" placeholder="LON">
+                            <input type="number" step="0.5" id="gys-alt" class="tactical-input" placeholder="ALT (opt)">
+                        </div>
+                        <div class="cmd-grid-2 mt-1">
+                            <button class="cmd-btn btn-primary" id="btn-gys">GO &amp; TRACK (GYS)</button>
+                            <button class="cmd-btn" id="btn-gys-here">USE DRONE POS</button>
+                        </div>
                     </div>
 
                     <!-- Telemetry -->
@@ -207,9 +225,9 @@
                         <div class="section-title">SENSORS & TELEMETRY</div>
                         <div class="cmd-grid-3">
                             <button class="cmd-btn btn-primary" data-cmd="status">POLL STATUS</button>
-                            <button class="cmd-btn" data-cmd="ping">PING</button>
                             <button class="cmd-btn" data-cmd="sensors">SENSORS</button>
                             <button class="cmd-btn" data-cmd="tare">TARE ALT</button>
+                            <button class="cmd-btn" data-cmd="ping">PING</button>
                         </div>
                     </div>
 
