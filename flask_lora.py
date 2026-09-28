@@ -565,21 +565,53 @@ TOWER_TOKEN = os.environ.get('TOWER_TOKEN', '').strip()
 TOWER_LISTEN = os.environ.get('TOWER_LISTEN', '1') != '0'
 
 _tower_ws = None
-_tower_send_lock = threading.Lock()
+_tower_out = queue.Queue(maxsize=200)   # outgoing messages; the sender thread drains it
 
 
 def tower_send(obj):
-    """Send a JSON message up the tower socket, if connected. Never raises."""
-    ws = _tower_ws
-    if ws is None:
+    """Queue a JSON message for the tower socket. Never blocks and never raises:
+    while the socket is down, messages are simply dropped (telemetry is sent
+    again on the next update anyway), so the radio and dashboard never wait on it."""
+    if _tower_ws is None:
         return False
     try:
-        with _tower_send_lock:
-            ws.send(json.dumps(obj))
-        return True
-    except Exception as e:
-        print(f"[TOWER] send failed: {e}", flush=True)
-        return False
+        _tower_out.put_nowait(json.dumps(obj))
+    except queue.Full:
+        try:
+            _tower_out.get_nowait()          # drop the oldest, keep the newest
+            _tower_out.put_nowait(json.dumps(obj))
+        except (queue.Empty, queue.Full):
+            pass
+    return True
+
+
+def _tower_sender():
+    while True:
+        msg = _tower_out.get()
+        ws = _tower_ws
+        if ws is None:
+            continue
+        try:
+            ws.send(msg)
+        except Exception as e:
+            print(f"[TOWER] send failed ({_short_reason(e)}) - will resend after reconnect", flush=True)
+
+
+def _short_reason(err):
+    """One-line reason from a websocket-client error."""
+    code = getattr(err, "status_code", None)
+    if code:
+        body = getattr(err, "resp_body", None)
+        body = body.decode(errors="replace").strip() if isinstance(body, (bytes, bytearray)) else ""
+        hint = {400: "server rejected the WebSocket handshake - check nginx Upgrade/Connection headers",
+                401: "unauthorised - set TOWER_TOKEN",
+                403: "forbidden - wrong TOWER_TOKEN or tower not allowed",
+                404: "no WebSocket at this path",
+                502: "backend down behind nginx",
+                503: "backend unavailable"}.get(code, "")
+        return f"HTTP {code}" + (f" {body[:60]}" if body else "") + (f" ({hint})" if hint else "")
+    text = str(err).strip() or err.__class__.__name__
+    return text.splitlines()[0][:160]
 
 
 def _num_or_none(v):
@@ -675,31 +707,49 @@ def _tower_loop():
         print("[TOWER] listener disabled: run  pip install websocket-client --break-system-packages",
               flush=True)
         return
+    websocket.setdefaulttimeout(10)      # a dead network can't hang a connect attempt
     headers = [f"Authorization: Bearer {TOWER_TOKEN}"] if TOWER_TOKEN else []
+    threading.Thread(target=_tower_sender, daemon=True).start()
     backoff = 2
+    attempt = 0
+    print(f"[TOWER] connecting to {TOWER_WS_URL} in the background (dashboard/radio don't wait for it)",
+          flush=True)
     while True:
+        attempt += 1
+        state = {"reason": None, "was_connected": False}
+
         def on_open(ws):
             global _tower_ws
-            nonlocal backoff
+            nonlocal backoff, attempt
             _tower_ws = ws
-            backoff = 2
+            state["was_connected"] = True
+            backoff, attempt = 2, 0
             print(f"[TOWER] connected to {TOWER_WS_URL}", flush=True)
             tower_send({"type": "hello", "tower_id": TOWER_ID})
 
         def on_close(ws, code, reason):
             global _tower_ws
             _tower_ws = None
-            print(f"[TOWER] disconnected ({code} {reason})", flush=True)
+            if code or reason:
+                state["reason"] = state["reason"] or f"closed by server ({code} {reason})".strip()
 
         def on_error(ws, err):
-            print(f"[TOWER] error: {err}", flush=True)
+            state["reason"] = _short_reason(err)
 
-        app_ws = websocket.WebSocketApp(TOWER_WS_URL, header=headers, on_open=on_open,
-                                        on_message=_on_tower_message, on_close=on_close,
-                                        on_error=on_error)
-        app_ws.run_forever(ping_interval=20, ping_timeout=10)
+        try:
+            app_ws = websocket.WebSocketApp(TOWER_WS_URL, header=headers, on_open=on_open,
+                                            on_message=_on_tower_message, on_close=on_close,
+                                            on_error=on_error)
+            app_ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:                      # never let the listener thread die
+            state["reason"] = _short_reason(e)
         _tower_ws = None
-        print(f"[TOWER] reconnecting in {backoff}s...", flush=True)
+
+        why = state["reason"] or "connection closed"
+        if state["was_connected"]:
+            print(f"[TOWER] disconnected: {why} - reconnecting in {backoff}s", flush=True)
+        else:
+            print(f"[TOWER] can't connect (attempt {attempt}): {why} - retry in {backoff}s", flush=True)
         time.sleep(backoff)
         backoff = min(backoff * 2, 30)
 
