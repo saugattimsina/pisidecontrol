@@ -412,6 +412,47 @@ document.addEventListener('DOMContentLoaded', () => {
         } catch (e) { log('ERR: RELAY OFFLINE', 'error'); }
     });
 
+    // GPS TEST FLIGHT: Flask runs takeoff -> hold -> RTL and checks drift; we just show progress.
+    const testStatus = document.getElementById('test-status');
+    let testLogShown = 0, testPolling = false;
+    async function pollTest() {
+        try {
+            const s = await (await fetch('/test-flight')).json();
+            (s.log || []).slice(testLogShown).forEach(l => log(`TEST // ${l}`, 'system'));
+            testLogShown = (s.log || []).length;
+            const m = s.metrics || {};
+            let txt = `TEST: ${s.phase}`;
+            if (m.max_drift_m != null) txt += ` | max drift ${m.max_drift_m} m, avg ${m.avg_drift_m} m, alt ${m.alt_min_m}-${m.alt_max_m} m`;
+            if (s.result) txt += ` | ${s.result.status}: ${s.result.reason}`;
+            testStatus.textContent = txt;
+            testStatus.style.color = s.result ? (s.result.status === 'PASS' ? '#00ff88' : '#ff5555') : '#ffcc00';
+            if (s.running) { setTimeout(pollTest, 1000); return; }
+        } catch (e) { /* relay offline */ }
+        testPolling = false;
+    }
+    document.getElementById('btn-test-start')?.addEventListener('click', async () => {
+        const alt = document.getElementById('test-alt').value;
+        const hold = document.getElementById('test-hold').value;
+        const drift = document.getElementById('test-drift').value;
+        if (!confirm(`GPS TEST FLIGHT on drone ${currentDroneId}:\n\n` +
+                     `take off to ${alt} m, hold ${hold} s (LAND if drift > ${drift} m), then RTL.\n\n` +
+                     `Area clear? RC in hand? RTL_ALT set low?`)) return;
+        const r = await fetch('/test-flight/start', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ drone: currentDroneId, alt, hold_s: hold, max_drift_m: drift })
+        });
+        const d = await r.json();
+        if (!r.ok) { log(`ERR: TEST ${d.error || d.message}`, 'error'); return; }
+        testLogShown = 0;
+        log(`TEST // started on drone ${currentDroneId}`, 'tx');
+        if (!testPolling) { testPolling = true; pollTest(); }
+    });
+    document.getElementById('btn-test-abort')?.addEventListener('click', async () => {
+        await fetch('/test-flight/abort', { method: 'POST' });
+        log('TEST // ABORT -> LAND sent', 'error');
+        if (!testPolling) { testPolling = true; pollTest(); }
+    });
+
     // Copy the drone's last reported position into the GYS fields (handy for tweaking)
     document.getElementById('btn-gys-here')?.addEventListener('click', () => {
         const loc = telLoc.textContent;

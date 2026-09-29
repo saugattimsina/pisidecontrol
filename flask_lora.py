@@ -1239,6 +1239,242 @@ def start_ws_links():
 start_tower_listener = start_ws_links     # old name
 
 
+
+# ----------------------------------------------------------------------------
+# GPS test flight:  take off -> hold altitude + position -> RTL -> landed
+#   POST /test-flight/start  {"drone": "1", "alt": 5, "hold_s": 20, "max_drift_m": 8}
+#   POST /test-flight/abort  -> LAND now
+#   GET  /test-flight        -> status, step log, drift/altitude results
+# Uses only commands the drone already has (status, t, ping, rtl, land).
+# Any check that fails during the flight -> LAND. The operator can abort any time.
+# ----------------------------------------------------------------------------
+class TestFlight:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.thread = None
+        self.abort_flag = threading.Event()
+        self.state = {"running": False, "phase": "idle", "result": None, "log": [], "metrics": {}}
+
+    # ---- helpers ----
+    def _log(self, msg):
+        line = f"{datetime.now().strftime('%H:%M:%S')} {msg}"
+        print(f"[TEST] {msg}", flush=True)
+        with self.lock:
+            self.state["log"].append(line)
+            self.state["log"] = self.state["log"][-80:]
+
+    def _phase(self, p):
+        with self.lock:
+            self.state["phase"] = p
+
+    def status(self):
+        with self.lock:
+            return json.loads(json.dumps(self.state))
+
+    def _tel(self, n):
+        """Ping the drone and return its latest state (or None if it didn't answer)."""
+        res, code = execute_command(f"{n}-ping")
+        if code != 200:
+            return None
+        with telemetry_lock:
+            st = drones.get(n)
+            return json.loads(json.dumps(st)) if st else None
+
+    def _sleep(self, s):
+        return self.abort_flag.wait(s)          # True = abort requested
+
+    def _land(self, n, why):
+        self._log(f"ABORT: {why} -> LAND")
+        self._phase("landing (abort)")
+        execute_command(f"{n}-land")
+
+    # ---- control ----
+    def start(self, n, alt, hold_s, max_drift):
+        with self.lock:
+            if self.state["running"]:
+                return False, "a test is already running"
+            self.state = {"running": True, "phase": "preflight", "result": None, "log": [],
+                          "metrics": {}, "drone": n, "alt": alt, "hold_s": hold_s, "max_drift_m": max_drift}
+        self.abort_flag.clear()
+        self.thread = threading.Thread(target=self._run, args=(n, alt, hold_s, max_drift), daemon=True)
+        self.thread.start()
+        return True, "started"
+
+    def abort(self):
+        n = self.state.get("drone") or "1"
+        self.abort_flag.set()
+        self._log("operator ABORT")
+        execute_command(f"{n}-land")            # immediately, whatever phase we're in
+        return True
+
+    # ---- the sequence ----
+    def _run(self, n, alt, hold_s, max_drift):
+        result, why = "FAIL", ""
+        airborne = False
+        try:
+            # 1. PREFLIGHT
+            self._log(f"drone {n}: preflight checks (target {alt:g} m, hold {hold_s:g} s, max drift {max_drift:g} m)")
+            execute_command(f"{n}-status")
+            st = self._tel(n)
+            if not st:
+                why = "no reply from drone"; self._log("FAIL: " + why); return
+            gps = st.get("gps") or {}
+            problems = []
+            if gps.get("enabled") is False:
+                problems.append("drone is in --no-gps mode (GPS:OFF)")
+            if not gps.get("fix"):
+                problems.append("no GPS fix")
+            if (gps.get("satellites") or 0) < 6:
+                problems.append(f"only {gps.get('satellites') or 0} satellites (need 6+)")
+            if st.get("armed"):
+                problems.append("already armed")
+            a0 = st.get("altitude_m")
+            if a0 is None or abs(a0) > 1.5:
+                problems.append(f"altitude reads {a0} m on the ground (should be ~0; baro/EKF offset)")
+            if problems:
+                why = "; ".join(problems); self._log("FAIL preflight: " + why); return
+            home = (gps["lat"], gps["lon"])
+            self._log(f"preflight OK: {gps.get('satellites')} sats, pos {home[0]:.6f},{home[1]:.6f}, alt {a0} m")
+
+            # 2. TAKEOFF
+            self._phase("takeoff")
+            res, code = execute_command(f"{n}-t {alt:g}")
+            reply = str(res.get("response") or res.get("message") or res.get("error"))
+            self._log(f"takeoff command -> {reply}")
+            if code != 200 or "OK" not in reply:
+                why = f"takeoff refused: {reply}"; return
+            airborne = True
+            t0, reached = time.time(), False
+            while time.time() - t0 < 30:
+                if self._sleep(1.0):
+                    why = "aborted by operator"; return
+                st = self._tel(n)
+                if not st:
+                    continue
+                a = st.get("altitude_m")
+                self._log(f"  climbing: alt {a} m, mode {st.get('mode')}")
+                if a is not None and a >= alt * 0.8:      # code stops native takeoff at ~85%
+                    reached = True
+                    break
+                if a is not None and a > alt + 3:
+                    self._land(n, f"overshoot to {a} m"); why = "overshoot"; return
+            if not reached:
+                self._land(n, "did not reach altitude in 30 s"); why = "takeoff timeout"; return
+
+            # 3. HOLD
+            self._phase("hold")
+            if self._sleep(2.0):                                  # let it settle
+                why = "aborted by operator"; return
+            st = self._tel(n) or {}
+            g = st.get("gps") or {}
+            if not g.get("fix"):
+                self._land(n, "lost GPS fix before hold"); why = "GPS lost"; return
+            ref = (g["lat"], g["lon"])
+            ref_alt = st.get("altitude_m")
+            self._log(f"HOLD start at {ref[0]:.6f},{ref[1]:.6f}, alt {ref_alt} m - holding {hold_s:g} s")
+            drifts, alts = [], []
+            t0 = time.time()
+            while time.time() - t0 < hold_s:
+                if self._sleep(1.5):
+                    why = "aborted by operator"; return
+                st = self._tel(n)
+                if not st:
+                    self._log("  (no reply this time)")
+                    continue
+                g = st.get("gps") or {}
+                a = st.get("altitude_m")
+                if not g.get("fix"):
+                    self._land(n, "GPS fix lost during hold"); why = "GPS lost"; return
+                d = _offset_m(ref[0], ref[1], g["lat"], g["lon"])
+                drifts.append(d)
+                if a is not None:
+                    alts.append(a)
+                self._log(f"  hold t+{time.time()-t0:4.1f}s: drift {d:4.1f} m, alt {a} m, "
+                          f"speed {st.get('ground_speed_ms')} m/s")
+                if d > max_drift:
+                    self._land(n, f"drifted {d:.1f} m (> {max_drift:g} m)"); why = "drift limit"; return
+                if a is not None and abs(a - alt) > 2.5:
+                    self._land(n, f"altitude {a} m out of {alt-2.5:g}-{alt+2.5:g} m"); why = "altitude limit"; return
+            m = {"max_drift_m": round(max(drifts), 2) if drifts else None,
+                 "avg_drift_m": round(sum(drifts) / len(drifts), 2) if drifts else None,
+                 "alt_min_m": min(alts) if alts else None, "alt_max_m": max(alts) if alts else None,
+                 "samples": len(drifts)}
+            with self.lock:
+                self.state["metrics"] = m
+            self._log(f"HOLD done: max drift {m['max_drift_m']} m, avg {m['avg_drift_m']} m, "
+                      f"alt {m['alt_min_m']}-{m['alt_max_m']} m")
+
+            # 4. RTL
+            self._phase("rtl")
+            res, code = execute_command(f"{n}-rtl")
+            reply = str(res.get("response") or res.get("message") or res.get("error"))
+            self._log(f"RTL command -> {reply}")
+            if code != 200 or "OK" not in reply:
+                self._land(n, f"RTL not accepted ({reply})"); why = "RTL refused"; return
+            t0 = time.time()
+            while time.time() - t0 < 90:
+                if self._sleep(2.0):
+                    why = "aborted by operator"; return
+                st = self._tel(n)
+                if not st:
+                    continue
+                a = st.get("altitude_m")
+                g = st.get("gps") or {}
+                dh = _offset_m(home[0], home[1], g["lat"], g["lon"]) if g.get("fix") else None
+                self._log(f"  returning: alt {a} m, {'%.1f' % dh if dh is not None else '?'} m from home, "
+                          f"armed {st.get('armed')}")
+                if st.get("armed") is False:
+                    airborne = False
+                    with self.lock:
+                        self.state["metrics"]["landed_from_home_m"] = round(dh, 2) if dh is not None else None
+                    result, why = "PASS", "landed and disarmed"
+                    self._log(f"LANDED {('%.1f m from take-off point' % dh) if dh is not None else ''} - PASS")
+                    return
+            why = "RTL still in progress after 90 s - watch the drone"
+            self._log(why)
+        except Exception as e:
+            why = f"test error: {e}"
+            self._log(why)
+            if airborne:
+                self._land(n, "test error")
+        finally:
+            with self.lock:
+                self.state["running"] = False
+                self.state["result"] = {"status": result, "reason": why}
+                self.state["phase"] = "done"
+            print(f"[TEST] RESULT {result}: {why}", flush=True)
+
+
+test_flight = TestFlight()
+
+
+@app.route('/test-flight', methods=['GET'])
+def test_flight_status():
+    return jsonify(test_flight.status())
+
+
+@app.route('/test-flight/start', methods=['POST'])
+def test_flight_start():
+    a = request.get_json(silent=True) or request.values
+    n = str(a.get("drone") or "1").strip()
+    alt = _num_or_none(a.get("alt")) or 5.0
+    hold = _num_or_none(a.get("hold_s")) or 20.0
+    drift = _num_or_none(a.get("max_drift_m")) or 8.0
+    if not (2.0 <= alt <= 10.0):
+        return jsonify({"error": "test altitude must be 2-10 m"}), 400
+    if not (5.0 <= hold <= 120.0):
+        return jsonify({"error": "hold time must be 5-120 s"}), 400
+    if not (2.0 <= drift <= 30.0):
+        return jsonify({"error": "max drift must be 2-30 m"}), 400
+    ok, msg = test_flight.start(n, alt, hold, drift)
+    return jsonify({"ok": ok, "message": msg}), (200 if ok else 409)
+
+
+@app.route('/test-flight/abort', methods=['POST'])
+def test_flight_abort():
+    test_flight.abort()
+    return jsonify({"ok": True, "message": "LAND sent"})
+
 if __name__ == '__main__':
     ensure_radio()
     start_my_gps()

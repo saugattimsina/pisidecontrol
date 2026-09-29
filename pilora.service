@@ -1,0 +1,24 @@
+[Unit]
+Description=pilora LoRa ground station (Flask dashboard + LoRa relay + Synaix WebSocket)
+# Wait for the network so the WebSocket / telemetry push can connect straight away
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=saugat
+WorkingDirectory=/home/saugat/pilora
+ExecStart=/usr/bin/python3 /home/saugat/pilora/flask_lora.py
+# Print log lines immediately (journalctl -u pilora -f)
+Environment=PYTHONUNBUFFERED=1
+# Optional settings - uncomment / edit, then: sudo systemctl restart pilora
+#Environment=MY_GPS=/dev/ttyACM0
+#Environment=WS_DRONES=1
+#Environment=TOWER_ID=Tower-1
+#Environment=LORA_BACKEND=serial
+#Environment=LORA_PORT=/dev/ttyUSB0
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

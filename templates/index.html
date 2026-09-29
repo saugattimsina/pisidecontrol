@@ -236,6 +236,21 @@
                         </div>
                     </div>
 
+                    <!-- GPS test flight: takeoff -> hold -> RTL -->
+                    <div class="cmd-section">
+                        <div class="section-title">GPS TEST FLIGHT (TAKEOFF &rarr; HOLD &rarr; RTL)</div>
+                        <div class="cmd-grid-3">
+                            <input type="number" step="0.5" min="2" max="10" id="test-alt" class="tactical-input" value="5" title="Takeoff altitude (m)" placeholder="ALT M">
+                            <input type="number" step="5" min="5" max="120" id="test-hold" class="tactical-input" value="20" title="Hold time (s)" placeholder="HOLD S">
+                            <input type="number" step="1" min="2" max="30" id="test-drift" class="tactical-input" value="8" title="Max drift before LAND (m)" placeholder="MAX DRIFT M">
+                        </div>
+                        <div class="cmd-grid-2 mt-1">
+                            <button class="cmd-btn btn-success" id="btn-test-start">START TEST</button>
+                            <button class="cmd-btn btn-danger" id="btn-test-abort">ABORT &rarr; LAND</button>
+                        </div>
+                        <div class="mt-1" id="test-status" style="font-size: 0.75rem; opacity: 0.85;">TEST: idle</div>
+                    </div>
+
                     <!-- Telemetry -->
                     <div class="cmd-section">
                         <div class="section-title">SENSORS & TELEMETRY</div>
