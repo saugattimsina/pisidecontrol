@@ -99,13 +99,24 @@ document.addEventListener('DOMContentLoaded', () => {
         if (data.Spd) telSpeed.textContent = `${data.Spd} m/s`;
         if (data.Vz) telVz.textContent = `${parseFloat(data.Vz) > 0 ? '+' : ''}${data.Vz} m/s`;
         
-        if (data.Sats) {
-            telSats.textContent = data.Sats;
-            if (parseInt(data.Sats) > 5) {
+        // GPS: the drone sends "Sats:12|Loc:50.25,-110.91" (or "Loc:none" before a fix).
+        // LOCKED only when it could arm in GPS mode: 6+ satellites AND a real position.
+        if (data.Sats !== undefined) {
+            const sats = parseInt(data.Sats, 10);
+            const hasPos = data.Loc !== undefined && data.Loc !== 'none' && data.Loc.includes(',');
+            telSats.textContent = isNaN(sats) ? '--' : String(sats);
+            telSats.className = `tel-val ${sats >= 6 ? 'text-green' : 'text-red'}`;
+            if (sats >= 6 && hasPos) {
                 telGpsLock.textContent = 'LOCKED';
                 telGpsLock.className = 'tel-val text-green';
+            } else if (sats > 0 && !hasPos) {
+                telGpsLock.textContent = 'NO FIX';
+                telGpsLock.className = 'tel-val text-red';
+            } else if (sats === 0) {
+                telGpsLock.textContent = 'NO GPS DATA';
+                telGpsLock.className = 'tel-val text-red';
             } else {
-                telGpsLock.textContent = 'WAITING';
+                telGpsLock.textContent = `WAITING (need 6)`;
                 telGpsLock.className = 'tel-val text-red';
             }
         }
@@ -193,7 +204,9 @@ document.addEventListener('DOMContentLoaded', () => {
             const response = await fetch('/send', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cmd: `${droneId}-ping` })   // ping reply carries A/M/Alt/GPS/Trk
+                // background: Flask only really pings when due (10 s on the ground, 5 s armed)
+                // and never right after an operator command; otherwise it answers from cache.
+                body: JSON.stringify({ cmd: `${droneId}-ping`, background: true })
             });
 
             const data = await response.json();
@@ -233,9 +246,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         isPolling = false;
-        // Wait before querying again. The drone radio is half-duplex and each poll
-        // makes it transmit twice (ACK + telemetry), so polling too fast drops commands.
-        setTimeout(pollMainDrone, 2500);
+        // Cheap: this only reads Flask's cache unless a real ping is due (see POLL_IDLE_S).
+        setTimeout(pollMainDrone, 2000);
     }
 
     // Button Bindings

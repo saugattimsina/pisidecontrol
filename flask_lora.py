@@ -85,6 +85,14 @@ SLOW_COMMAND_WAIT_S = {"t": 12.0, "takeoff": 12.0, "arm": 12.0}
 # processCommand() also lets these bypass its command queue).
 EMERGENCY_COMMANDS = {"land", "l", "stop", "estop"}
 
+# Background telemetry polling (dashboard + WebSocket share ONE poller, see background_ping()).
+# The radio is half-duplex and every poll makes the drone transmit, so polls are rare and
+# always give way to operator commands.
+POLL_IDLE_S = float(os.environ.get('POLL_IDLE_S', '10'))    # drone on the ground (disarmed)
+POLL_ARMED_S = float(os.environ.get('POLL_ARMED_S', '5'))   # drone armed / flying
+POLL_PAUSE_S = float(os.environ.get('POLL_PAUSE_S', '5'))   # quiet time after any operator command
+POLL_WAIT_S = 1.5                                           # a pong takes ~0.6-0.8 s at SF9
+
 # Commands whose real answer is a telemetry line sent after any ACK.
 # Every other command returns as soon as its ACK arrives.
 TELEMETRY_COMMANDS = {"status", "sensors", "ping"}
@@ -101,13 +109,14 @@ TELEMETRY_COMMANDS = {"status", "sensors", "ping"}
 # ----------------------------------------------------------------------------
 TELEMETRY_PUSH_URL = os.environ.get('TELEMETRY_PUSH_URL', 'https://api.synaix.viclyx.com/api/status/pi-data').strip()
 TELEMETRY_PUSH_TOKEN = os.environ.get('TELEMETRY_PUSH_TOKEN', '').strip()
-ONLINE_TIMEOUT_S = 10.0          # no message for this long -> "online": false
+ONLINE_TIMEOUT_S = 25.0          # no message for this long -> "online": false (polls are every 5-10 s)
 
 _DRONE_RE = re.compile(r'^\[Drone ([^\]]+)\]\s*(.*)$')
 _TELEMETRY_KEYS = {"A", "M", "Alt", "Baro", "Spd", "Vz", "Sats", "Loc", "GPS", "Trk", "Go"}
 
 telemetry_lock = threading.Lock()
 drones = {}                      # drone_id -> state dict
+_last_tel_line = {}              # drone_id -> last line with telemetry fields (for cached polls)
 events = deque(maxlen=100)       # non-telemetry replies ("arm: OK armed", "gys: ARRIVED"...)
 _push_queue = queue.Queue(maxsize=50)
 
@@ -200,6 +209,8 @@ def record_line(line, rssi=None, snr=None):
                     lat, lon = _num(la), _num(lo)
                     ok = lat is not None and lon is not None and not (lat == 0 and lon == 0)
                     gps.update(fix=ok, lat=lat if ok else None, lon=lon if ok else None)
+        if f:
+            _last_tel_line[drone_id] = line
         if f:   # a telemetry line: Go present means a gys go-to is running
             st["goto"] = {"active": "Go" in f, "remaining_m": _num(f["Go"], "m") if "Go" in f else None}
         if keyword and not f:
@@ -545,9 +556,53 @@ def drain_rx():
 _CMD_RE = re.compile(r'^[A-Za-z0-9_]+-[\x20-\x7e]{1,100}$')
 
 
-def execute_command(cmd):
+_last_operator_cmd = 0.0      # time.time() of the last operator (non-background) command
+_last_poll_tx = {}            # drone id -> time.time() of the last background ping sent
+
+
+def _state_age_s(drone_id):
+    with telemetry_lock:
+        st = drones.get(drone_id)
+        last = st["updated_at"] if st else None
+        armed = bool(st and st.get("armed"))
+        line = _last_tel_line.get(drone_id)
+    age = ((datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
+           if last else None)
+    return age, armed, line
+
+
+def _cached_reply(cmd, drone_id, why):
+    age, _, line = _state_age_s(drone_id)
+    if line and age is not None and age <= ONLINE_TIMEOUT_S:
+        return {"status": "success", "command": cmd, "response": line, "cached": True,
+                "age_s": round(age, 1), "note": why}, 200
+    return {"status": "timeout", "command": cmd, "cached": True, "note": why,
+            "message": "no recent data from drone"}, 408
+
+
+def background_ping(drone_id):
+    """Low-priority telemetry poll, shared by the dashboard and the WebSocket link.
+    Only transmits a ping when one is due (POLL_IDLE_S on the ground, POLL_ARMED_S when
+    armed), never within POLL_PAUSE_S of an operator command, and never while another
+    exchange is on the radio. Otherwise it answers from the last telemetry received."""
+    cmd = f"{drone_id}-ping"
+    now = time.time()
+    age, armed, _ = _state_age_s(drone_id)
+    interval = POLL_ARMED_S if armed else POLL_IDLE_S
+    if now - _last_operator_cmd < POLL_PAUSE_S:
+        return _cached_reply(cmd, drone_id, "operator command just sent - poll skipped")
+    # any telemetry heard recently (e.g. a reply to an operator command) counts as a poll
+    if (age is not None and age < interval - 1.0) or now - _last_poll_tx.get(drone_id, 0.0) < interval - 0.5:
+        return _cached_reply(cmd, drone_id, "not due")
+    return execute_command(cmd, background=True)
+
+
+def execute_command(cmd, background=False):
     """Send one '<id>-<command>' over LoRa and wait for the drone's reply.
-    Returns (result_dict, http_status). Used by the web dashboard AND the tower socket."""
+    Returns (result_dict, http_status). Used by the web dashboard AND the tower socket.
+    background=True (only from background_ping): never waits for the radio - if an operator
+    command is using it, the poll is skipped - and waits at most POLL_WAIT_S for the pong."""
+    global _last_operator_cmd
     if not ensure_radio():
         return {"error": "LoRa radio not connected - see Flask terminal"}, 500
     cmd = (cmd or "").strip()
@@ -568,8 +623,12 @@ def execute_command(cmd):
         return {"status": "success", "command": cmd,
                 "response": "SENT to all drones - broadcasts are never acknowledged"}, 200
 
+    if background:
+        if not io_lock.acquire(blocking=False):
+            return _cached_reply(cmd, cmd.split('-', 1)[0], "radio busy - poll skipped")
+        _last_poll_tx[cmd.split('-', 1)[0]] = time.time()
     # Emergency commands go out immediately, even while a poll is waiting for its reply.
-    if action in EMERGENCY_COMMANDS and not io_lock.acquire(blocking=False):
+    elif action in EMERGENCY_COMMANDS and not io_lock.acquire(blocking=False):
         try:
             transmit(cmd)
         except Exception as e:
@@ -584,7 +643,7 @@ def execute_command(cmd):
         drain_rx()                 # drop stale lines from earlier exchanges
         transmit(cmd)
 
-        wait_s = SLOW_COMMAND_WAIT_S.get(action, MAX_WAIT_SECONDS)
+        wait_s = POLL_WAIT_S if background else SLOW_COMMAND_WAIT_S.get(action, MAX_WAIT_SECONDS)
         deadline = time.time() + wait_s
         ack, response = "", ""
         while True:
@@ -623,6 +682,8 @@ def execute_command(cmd):
             radio.alive = False     # re-open on the next request
         return {"error": str(e)}, 500
     finally:
+        if not background:
+            _last_operator_cmd = time.time()   # background polls stay quiet for POLL_PAUSE_S
         io_lock.release()
 
 
@@ -637,7 +698,11 @@ def send_command():
     if not cmd:
         return jsonify({"error": "No command provided. Use ?cmd=1-arm or send JSON {'cmd': '1-arm'}"}), 400
 
-    result, status = execute_command(cmd)
+    background = bool(data.get('background')) if (request.method == 'POST' and data) else False
+    if background and cmd.strip().lower().endswith('-ping'):
+        result, status = background_ping(cmd.strip().split('-', 1)[0])   # dashboard auto-poll
+    else:
+        result, status = execute_command(cmd)
     return jsonify(result), status
 
 
@@ -674,8 +739,8 @@ def send_command():
 #   WS_MAC_1=aa:bb:...        MAC per drone (default 02:00:00:00:00:0<n>)
 #   WS_KEY=...                optional &key=...
 #   WS_SEND=0                 listen-only (no telemetry / acks / pings)
-#   WS_POLL_S=3               if a drone has been quiet this long, ping it over LoRa so the
-#                             server keeps getting data (0 = off; the dashboard polls too)
+#   WS_POLL_S=3               0 = the socket link never pings the drone itself. Otherwise it
+#                             uses the shared low-priority poller (POLL_IDLE_S / POLL_ARMED_S)
 #   WS_TOWER=1                also connect as the tower (TOWER_ID, default Tower-1), listen-only
 #   WS_ENABLE=0               no WebSocket at all
 # ----------------------------------------------------------------------------
@@ -1302,27 +1367,18 @@ def _push_latest_to_socket(sock):
 
 
 def _auto_poller():
-    """Ping a connected drone over LoRa when it has been quiet for WS_POLL_S."""
+    """Keep the server fed with telemetry for each connected drone. Uses the same
+    low-priority background_ping() as the dashboard, so the drone is never pinged twice."""
+    if WS_POLL_S <= 0:
+        return
     while True:
         time.sleep(1.0)
         for num, sock in list(drone_sockets.items()):
-            if not sock.connected or sock.poll_busy:
-                continue
-            with telemetry_lock:
-                st = drones.get(num)
-                last = st["updated_at"] if st else None
-            age = ((datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
-                   if last else 1e9)
-            if age < WS_POLL_S:
-                continue
-
-            def poll(n=num, s=sock):
-                s.poll_busy = True
+            if sock.connected:
                 try:
-                    execute_command(f"{n}-ping")
-                finally:
-                    s.poll_busy = False
-            threading.Thread(target=poll, daemon=True).start()
+                    background_ping(num)
+                except Exception as e:
+                    print(f"[WS] poll error: {e}", flush=True)
 
 
 def start_ws_links():
