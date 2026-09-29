@@ -2,8 +2,9 @@
 Flask LoRa ground-station relay for the pilora dashboard.
 
 Two radio backends:
-  sx1262 - SX1262 wired to a Raspberry Pi over SPI (same pins / settings as
-           lora-c.py, the setup confirmed talking to the drone both ways)
+  sx1262 - SX1262 wired to a Raspberry Pi over SPI. Radio settings, framing and
+           reassembly are a mirror of the drone's src/lora_link.cpp - keep the
+           two in step (see the "LoRa link" block below).
   serial - a USB/UART LoRa module on /dev/ttyUSB0 (transparent bridge)
 
 LORA_BACKEND=auto (default) picks sx1262 when LoRaRF is installed and SPI is
@@ -12,7 +13,7 @@ enabled, otherwise serial. Override with environment variables, e.g.
   LORA_BACKEND=serial LORA_PORT=/dev/ttyACM0 python flask_lora.py
 
 Only ONE program can own the radio: stop lora-c.py / lora_serial.py /
-ground_station.py before starting this.
+ground_station.py before starting this. LORA_DEBUG=1 prints every raw packet.
 """
 import json
 import os
@@ -44,23 +45,42 @@ LORA_BACKEND = os.environ.get('LORA_BACKEND', 'auto').lower()
 SERIAL_PORT = os.environ.get('LORA_PORT', '/dev/ttyUSB0')
 BAUD_RATE = int(os.environ.get('LORA_BAUD', '115200'))
 
-# sx1262 backend - identical to lora-c.py ("confirmed working values")
-SPI_BUS, SPI_CS = 0, 0
-PIN_RESET, PIN_BUSY, PIN_IRQ, PIN_TXEN, PIN_RXEN = 22, 23, 24, 5, 6
-FREQUENCY = 915_000_000
-TX_POWER = 22
-SPREADING_FACTOR = 9
-BANDWIDTH = 125_000
-CODING_RATE = 5
-PREAMBLE_LEN = 12
-SYNC_WORD = 0x12
-REASSEMBLY_GAP_SECONDS = 0.2   # fragments closer than this are one message
+# ----------------------------------------------------------------------------
+# LoRa link - MUST match the drone (include/lora_link.hpp LoraConfig and
+# src/lora_link.cpp). Change a value here -> change it there too.
+# ----------------------------------------------------------------------------
+SPI_BUS, SPI_CS = 0, 0                                               # spi_device /dev/spidev0.0
+PIN_RESET, PIN_BUSY, PIN_IRQ, PIN_TXEN, PIN_RXEN = 22, 23, 24, 5, 6  # pin_reset/busy/irq/txen/rxen
+FREQUENCY = 915_000_000       # frequency
+TX_POWER = 22                 # tx_power (dBm)
+SPREADING_FACTOR = 9          # spreading_factor
+BANDWIDTH = 125_000           # bandwidth (Hz)
+CODING_RATE = 5               # coding_rate: 5 = 4/5
+PREAMBLE_LEN = 12             # preamble_len
+SYNC_WORD = 0x1424            # sync_word, the raw register value (private network).
+                              # LoRaRF writes values > 0xFF as-is; 0x12 is its short form.
+# Low-data-rate optimisation: same rule as SX1262::begin() (on when a symbol > 16 ms).
+LDRO = (2 ** SPREADING_FACTOR) * 1000.0 / BANDWIDTH > 16.0
+# Packets: explicit header, CRC on, standard IQ (setPacketParams); RX takes up to 255 bytes.
+MAX_PACKET = 255              # SX1262::transmit() cuts longer messages at 255 bytes
+TX_TIMEOUT_S = 5.0            # SX1262::transmit() deadline (255 B at SF9/125k is ~1.3 s)
+# Receive-side reassembly - LoraLink::radioLoop():
+REASSEMBLY_GAP_S = 0.3        # kReassemblyGap: no newline after this much silence -> flush
+MAX_MESSAGE = 512             # kMaxMessage: buffer longer than this -> discard
+RX_POLL_S = 0.005             # radioLoop sleeps 5 ms per pass
+# Addressing - LoraLink::handlePacket():
+#   "<id>-<cmd>"  only that drone runs it; ACK (drone run with --lora-ack) is "ACK <id> <cmd>"
+#   "all-<cmd>"   every drone runs it, ONLY land / l / stop / estop / rtl, never ACKed
+ALL_PREFIX = "all-"
+BROADCAST_COMMANDS = {"land", "l", "stop", "estop", "rtl"}
+LORA_DEBUG = os.environ.get('LORA_DEBUG', '0') == '1'   # print every raw fragment
 
 # How long to wait for the drone's reply (ACK + telemetry can be two packets).
 MAX_WAIT_SECONDS = 4.0
 
-# Commands that must never queue behind a background poll.
-EMERGENCY_COMMANDS = {"land", "stop", "estop"}
+# Commands that must never queue behind a background poll (the drone's
+# processCommand() also lets these bypass its command queue).
+EMERGENCY_COMMANDS = {"land", "l", "stop", "estop"}
 
 # Commands whose real answer is a telemetry line sent after any ACK.
 # Every other command returns as soon as its ACK arrives.
@@ -267,9 +287,19 @@ def telemetry_one(drone_id):
 
 
 # ----------------------------------------------------------------------------
-# Radio backends. Both push every complete received line into rx_queue.
+# Radio backends. Both hand every complete received line to _deliver().
 # ----------------------------------------------------------------------------
+def _deliver(radio_obj, line, rssi=None, snr=None):
+    """One complete line from the drone: log it, update telemetry, wake the waiting command."""
+    sig = f"  (RSSI {rssi} dBm, SNR {snr} dB)" if rssi is not None else ""
+    print(f"[RX] {line}{sig}", flush=True)
+    record_line(line, rssi, snr)
+    radio_obj.rx_queue.put(line)
+
+
 class SerialRadio:
+    """USB/UART LoRa module (transparent bridge): the module does the radio part,
+    lines are newline-framed exactly like the SPI link."""
     name = "serial"
 
     def __init__(self):
@@ -292,85 +322,148 @@ class SerialRadio:
                 self.alive = False
                 break
             if line:
-                print(f"[RX] {line}", flush=True)
-                record_line(line)
-                self.rx_queue.put(line)
+                _deliver(self, line)
 
     def send(self, line):
         with self._tx_lock:
-            self.ser.write(f"{line}\n".encode('utf-8'))
+            self.ser.write((line.rstrip("\r\n") + "\n").encode('utf-8'))
             self.ser.flush()
 
 
+class LineAssembler:
+    """Joins received LoRa packets into lines with the SAME rules as the drone's
+    LoraLink::radioLoop() (src/lora_link.cpp). A DX-LR30 module splits one line into
+    ~5-byte packets ("1-sta" + "tus\\n"), so a line is only used once it is whole:
+      - packets are appended; everything up to the LAST newline is complete and handed on,
+        whatever follows it waits for more packets
+      - no newline and REASSEMBLY_GAP_S of silence -> the leftover is handed on anyway
+      - a packet with a CRC error "poisons" the message it belongs to: that whole message
+        is dropped (a missing piece could turn "1-t 15" into "1-t 1")
+      - more than MAX_MESSAGE bytes buffered -> discarded
+    Pure logic, no radio - tested on its own."""
+
+    def __init__(self, on_line):
+        self.on_line = on_line
+        self.buf = ""
+        self.poisoned = False
+        self.last = 0.0
+
+    def fragment(self, text, now):
+        if LORA_DEBUG:
+            print(f'[LORA] RX fragment "{text.strip()}"', flush=True)
+        self.buf += text
+        self.last = now
+        if len(self.buf) > MAX_MESSAGE:
+            print("[LORA] ⚠️ Receive buffer overflow - discarding.", flush=True)
+            self.buf, self.poisoned = "", False
+            return
+        nl = max(self.buf.rfind("\n"), self.buf.rfind("\r"))
+        if nl < 0:
+            return
+        complete, self.buf = self.buf[:nl + 1], self.buf[nl + 1:]
+        if self.poisoned:
+            print(f'[LORA] ⚠️ Dropped message "{complete.strip()}" (a packet was corrupted)', flush=True)
+            self.poisoned = False
+            return
+        self._emit(complete)
+
+    def corrupted(self, now):
+        self.poisoned = True
+        self.last = now
+
+    def tick(self, now):
+        """Call often: flushes a message whose packets stopped without a newline."""
+        if (self.buf or self.poisoned) and now - self.last > REASSEMBLY_GAP_S:
+            if self.poisoned:
+                print(f'[LORA] ⚠️ Dropped incomplete message "{self.buf.strip()}" '
+                      "(a packet was corrupted)", flush=True)
+            elif self.buf.strip():
+                self._emit(self.buf)
+            self.buf, self.poisoned = "", False
+
+    def _emit(self, text):
+        for line in re.split(r"[\r\n]", text):       # one packet may hold several lines
+            line = line.strip()
+            if line:
+                self.on_line(line)
+
+
 class Sx1262Radio:
+    """SX1262 on SPI through LoRaRF, configured like the drone's SX1262::begin()."""
     name = "sx1262"
 
     def __init__(self):
         from LoRaRF import SX126x
         self.rx_queue = queue.Queue()
         self._lock = threading.Lock()       # one SPI user at a time
+        self._rssi = self._snr = None
+        self._rx = LineAssembler(lambda line: _deliver(self, line, self._rssi, self._snr))
         LoRa = SX126x()
         if not LoRa.begin(SPI_BUS, SPI_CS, PIN_RESET, PIN_BUSY, PIN_IRQ, PIN_TXEN, PIN_RXEN):
             raise RuntimeError("SX1262 init failed - check wiring / SPI enabled / "
-                               "lora-c.py or another program not holding the pins")
+                               "the drone program or lora-c.py not holding the pins")
         LoRa.setFrequency(FREQUENCY)
         LoRa.setTxPower(TX_POWER, LoRa.TX_POWER_SX1262)
-        LoRa.setLoRaModulation(SPREADING_FACTOR, BANDWIDTH, CODING_RATE)
-        LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, PREAMBLE_LEN, 15, crcType=True)
+        LoRa.setLoRaModulation(SPREADING_FACTOR, BANDWIDTH, CODING_RATE, LDRO)
+        LoRa.setLoRaPacket(LoRa.HEADER_EXPLICIT, PREAMBLE_LEN, MAX_PACKET, crcType=True, invertIq=False)
         LoRa.setSyncWord(SYNC_WORD)
         self.LoRa = LoRa
+        self.ST_RX_DONE = getattr(LoRa, "STATUS_RX_DONE", 7)
+        self.ST_HEADER_ERR = getattr(LoRa, "STATUS_HEADER_ERR", 8)
+        self.ST_CRC_ERR = getattr(LoRa, "STATUS_CRC_ERR", 9)
         self.alive = True
         with self._lock:
             LoRa.request(LoRa.RX_CONTINUOUS)
         threading.Thread(target=self._rx_loop, daemon=True).start()
-        print(f"[*] SX1262 ready | {FREQUENCY / 1e6} MHz | SF{SPREADING_FACTOR} | {TX_POWER} dBm")
-
-    def _push(self, parts, rssi, snr):
-        text = "".join(parts)
-        for line in text.replace("\r", "\n").split("\n"):
-            line = line.strip()
-            if line:
-                print(f"[RX] {line}  (RSSI {rssi} dBm, SNR {snr} dB)", flush=True)
-                record_line(line, rssi, snr)
-                self.rx_queue.put(line)
+        print(f"[LORA] ✅ Radio ready | {FREQUENCY / 1e6:.1f} MHz | SF{SPREADING_FACTOR} | "
+              f"BW {BANDWIDTH / 1e3:.1f} kHz | CR 4/{CODING_RATE} | {TX_POWER} dBm | "
+              f"sync 0x{SYNC_WORD:04X}", flush=True)
 
     def _rx_loop(self):
         LoRa = self.LoRa
-        parts, last_t, rssi, snr = [], None, None, None
         while self.alive:
+            frag, status = None, None
             try:
                 with self._lock:
-                    if LoRa.status() == 7:                 # STATUS_RX_DONE
-                        length = LoRa.available()
-                        if length:
-                            frag = bytes(LoRa.read(length)).decode(errors="replace")
-                            now = time.time()
-                            if parts and last_t is not None and now - last_t > REASSEMBLY_GAP_SECONDS:
-                                self._push(parts, rssi, snr)
-                                parts = []
-                            rssi, snr = LoRa.packetRssi(), LoRa.snr()
-                            parts.append(frag)
-                            last_t = now
-                        LoRa.request(LoRa.RX_CONTINUOUS)
+                    status = LoRa.status()           # reading it clears the event (RX continuous)
+                    if status == self.ST_RX_DONE:
+                        n = LoRa.available()
+                        frag = bytes(LoRa.read(n)).decode(errors="replace") if n else ""
+                    if status in (self.ST_RX_DONE, self.ST_CRC_ERR):
+                        self._rssi, self._snr = LoRa.packetRssi(), LoRa.snr()
+                    if status in (self.ST_RX_DONE, self.ST_CRC_ERR, self.ST_HEADER_ERR):
+                        LoRa.request(LoRa.RX_CONTINUOUS)   # no-op if still receiving
             except Exception as e:
                 print(f"[!] SX1262 RX error: {e}", flush=True)
                 time.sleep(0.5)
 
-            if parts and last_t is not None and time.time() - last_t > REASSEMBLY_GAP_SECONDS:
-                self._push(parts, rssi, snr)
-                parts, last_t = [], None
-            time.sleep(0.02)
+            now = time.time()
+            if status == self.ST_HEADER_ERR:
+                print(f"[LORA] ⚠️ Heard a LoRa signal but its header didn't decode - check that the "
+                      f"drone uses SF{SPREADING_FACTOR} / BW {BANDWIDTH / 1e3:.1f} kHz / "
+                      f"CR 4/{CODING_RATE}", flush=True)
+            elif status == self.ST_CRC_ERR:
+                print(f"[LORA] ⚠️ Dropped corrupted packet (CRC error, RSSI {self._rssi} dBm, "
+                      f"SNR {self._snr} dB)", flush=True)
+                self._rx.corrupted(now)
+            elif frag:
+                self._rx.fragment(frag, now)
+            self._rx.tick(now)
+            time.sleep(RX_POLL_S)
 
     def send(self, line):
-        data = list(f"{line}\n".encode())
+        """Like LoraLink::send() + SX1262::transmit(): one packet ending in '\\n' (the other
+        side waits for it), at most MAX_PACKET bytes, then straight back to continuous RX."""
+        data = list((line.rstrip("\r\n") + "\n").encode()[:MAX_PACKET])
         with self._lock:
             LoRa = self.LoRa
             LoRa.beginPacket()
             LoRa.write(data, len(data))
             LoRa.endPacket()
-            LoRa.wait()
+            done = LoRa.wait(TX_TIMEOUT_S)
             LoRa.request(LoRa.RX_CONTINUOUS)
-
+        if done is False:
+            print(f'[LORA] ⚠️ TX timeout sending "{line.strip()}"', flush=True)
 
 radio = None
 radio_init_lock = threading.Lock()
@@ -401,7 +494,7 @@ def ensure_radio():
             radio = None
             print(f"[!] Radio init failed (backend={LORA_BACKEND}): {e}", flush=True)
             print("[!] serial: right port? (ls /dev/ttyUSB* /dev/ttyACM*) user in 'dialout'?", flush=True)
-            print("[!] sx1262: SPI enabled? rpi-lgpio installed? lora-c.py stopped?", flush=True)
+            print("[!] sx1262: SPI enabled? rpi-lgpio installed? drone program / lora-c.py stopped?", flush=True)
             return False
         return True
 
@@ -418,15 +511,17 @@ def command_action(cmd):
 
 
 def reply_matches(cmd, line):
-    """True if a received line is the answer to cmd. The drone replies
-    '[Drone <id>] <first word of command>: ...', status replies with bare
-    fields ('[Drone 1] A:N|M:...'), and ACKs are 'ACK <command>'.
+    """True if a received line is the answer to cmd. The drone (command_dispatcher.cpp)
+    replies '[Drone <id>] <first word of command>: ...', status replies with bare fields
+    ('[Drone 1] A:N|M:...'), and with --lora-ack LoraLink sends 'ACK <id> <command>'.
     Lines for other commands/drones are ignored here (still recorded as telemetry)."""
     drone_id = cmd.split('-', 1)[0]
     action = command_action(cmd)
     if line.startswith("ACK"):
-        rest = line[3:].strip()
-        return rest.split(' ')[0].lower() == action if rest else True
+        words = line[3:].split()
+        if len(words) >= 2 and words[0] == drone_id:     # "ACK 1 t 20"
+            return words[1].lower() == action
+        return bool(words) and words[0].lower() == action  # older firmware: "ACK t 20"
     parsed = parse_drone_line(line)
     if parsed is None or parsed[0] != drone_id:
         return False
@@ -456,6 +551,19 @@ def execute_command(cmd):
     if not _CMD_RE.match(cmd):
         return {"error": f"bad command {cmd!r} - expected '<drone id>-<command>', e.g. 1-status"}, 400
     action = command_action(cmd)
+
+    # "all-<cmd>": every drone runs it (LoraLink::handlePacket). The drones only accept
+    # land / l / stop / estop / rtl this way and never ACK it, so send once, don't wait.
+    if cmd.lower().startswith(ALL_PREFIX):
+        if action not in BROADCAST_COMMANDS:
+            return {"error": f"'{cmd}': drones ignore broadcast '{action}' - only "
+                             f"{', '.join(sorted(BROADCAST_COMMANDS))} can go to all"}, 400
+        try:
+            transmit(cmd)
+        except Exception as e:
+            return {"error": str(e)}, 500
+        return {"status": "success", "command": cmd,
+                "response": "SENT to all drones - broadcasts are never acknowledged"}, 200
 
     # Emergency commands go out immediately, even while a poll is waiting for its reply.
     if action in EMERGENCY_COMMANDS and not io_lock.acquire(blocking=False):
