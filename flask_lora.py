@@ -77,6 +77,9 @@ LORA_DEBUG = os.environ.get('LORA_DEBUG', '0') == '1'   # print every raw fragme
 
 # How long to wait for the drone's reply (ACK + telemetry can be two packets).
 MAX_WAIT_SECONDS = 4.0
+# The drone only answers these after arming + setting home (DO_SET_HOME, then up to 3 s
+# waiting for the autopilot to confirm it), so the reply can take 2-6 s.
+SLOW_COMMAND_WAIT_S = {"t": 12.0, "takeoff": 12.0, "arm": 12.0}
 
 # Commands that must never queue behind a background poll (the drone's
 # processCommand() also lets these bypass its command queue).
@@ -581,8 +584,8 @@ def execute_command(cmd):
         drain_rx()                 # drop stale lines from earlier exchanges
         transmit(cmd)
 
-        wants_telemetry = action in TELEMETRY_COMMANDS
-        deadline = time.time() + MAX_WAIT_SECONDS
+        wait_s = SLOW_COMMAND_WAIT_S.get(action, MAX_WAIT_SECONDS)
+        deadline = time.time() + wait_s
         ack, response = "", ""
         while True:
             remaining = deadline - time.time()
@@ -595,9 +598,7 @@ def execute_command(cmd):
             if not reply_matches(cmd, line):
                 continue          # a late reply to another command, or another drone
             if line.startswith("ACK"):
-                ack = line
-                if not wants_telemetry:
-                    break
+                ack = line        # only "received" - keep waiting for the real answer (OK/FAILED...)
                 continue
             response = line
             break
@@ -613,7 +614,7 @@ def execute_command(cmd):
                     "ack": ack, "telemetry": tel}, 200
         if ack:
             return {"status": "success", "command": cmd, "response": ack, "ack": ack}, 200
-        print(f"[!] No reply to '{cmd}' within {MAX_WAIT_SECONDS}s", flush=True)
+        print(f"[!] No reply to '{cmd}' within {wait_s:g}s", flush=True)
         return {"status": "timeout", "command": cmd, "message": "No response from drone"}, 408
 
     except Exception as e:
@@ -1449,8 +1450,17 @@ class TestFlight:
             res, code = execute_command(f"{n}-t {alt:g}")
             reply = str(res.get("response") or res.get("message") or res.get("error"))
             self._log(f"takeoff command -> {reply}")
-            if code != 200 or "OK" not in reply:
-                why = f"takeoff refused: {reply}"; return
+            if code != 200 or not reply.split(":", 1)[-1].strip().startswith("OK"):
+                # Refused, or the answer got lost. Never assume: look at the drone.
+                st = self._tel(n)
+                armed = bool(st and st.get("armed"))
+                refused = any(w in reply for w in ("FAILED", "REJECTED", "ERR"))
+                if armed and refused:
+                    self._land(n, f"takeoff refused but drone is armed ({reply})")
+                    why = f"takeoff refused: {reply}"; return
+                if not armed:
+                    why = f"takeoff refused: {reply}"; self._log("FAIL: " + why); return
+                self._log("no clear takeoff reply, but the drone is ARMED - treating as taking off")
             airborne = True
             t0, reached = time.time(), False
             while time.time() - t0 < 30:
